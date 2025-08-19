@@ -46,6 +46,8 @@ const logger = winston.createLogger({
 
 const app = express();
 const server = http.createServer(app);
+// CORS origin from env (must be defined before using in Socket.IO)
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const io = socketIo(server, {
   cors: {
     origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN,
@@ -54,7 +56,6 @@ const io = socketIo(server, {
 });
 
 // CORS
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN }));
 app.use(express.json({
   verify: (req, res, buf) => {
