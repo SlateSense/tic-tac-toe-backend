@@ -16,7 +16,10 @@
     "socket.io": "^4.8.1",
     "uuid": "^9.0.1",
     "express-rate-limit": "^7.5.0",
-    "express-queue": "^0.0.13"
+    "express-queue": "^0.0.13",
+    "winston": "^3.13.0",
+    "winston-daily-rotate-file": "^4.7.1",
+    "bech32": "^2.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
