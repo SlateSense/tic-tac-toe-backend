@@ -45,6 +45,9 @@ const logger = winston.createLogger({
 });
 
 const app = express();
+// Trust the first proxy hop (common for cloud platforms like Render/Heroku)
+// This allows express-rate-limit to correctly read client IPs via X-Forwarded-For
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 // CORS origin from env (must be defined before using in Socket.IO)
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
