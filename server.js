@@ -12,6 +12,8 @@ const Queue = require('express-queue');
 const winston = require('winston');
 const { bech32 } = require('bech32');
 require('winston-daily-rotate-file');
+const https = require('https');
+const dns = require('dns');
 
 // Configure Winston logging
 const logger = winston.createLogger({
@@ -43,6 +45,13 @@ const logger = winston.createLogger({
     })
   ]
 });
+
+// Prefer IPv4 DNS resolution to avoid IPv6-related DNS/socket issues
+try { dns.setDefaultResultOrder('ipv4first'); } catch (e) {}
+const ipv4Lookup = (hostname, options, cb) => dns.lookup(hostname, { family: 4, all: false }, cb);
+const httpAgent = new http.Agent({ keepAlive: true, lookup: ipv4Lookup });
+const httpsAgent = new https.Agent({ keepAlive: true, lookup: ipv4Lookup });
+const httpClient = axios.create({ httpAgent, httpsAgent });
 
 const app = express();
 // Trust the first proxy hop (common for cloud platforms like Render/Heroku)
@@ -85,8 +94,8 @@ const webhookLimiter = rateLimit({
 });
 const webhookQueue = Queue({ activeLimit: 1, queuedLimit: -1 });
 
-const SPEED_WALLET_API_BASE = 'https://api.speed.app/v1';
-const SPEED_API_BASE = 'https://api.speed.app/2022-04-15';
+const SPEED_WALLET_API_BASE = process.env.SPEED_WALLET_API_BASE || 'https://api.speed.app/v1';
+const SPEED_API_BASE = process.env.SPEED_API_BASE || 'https://api.speed.app/2022-04-15';
 const AUTH_HEADER = Buffer.from(`:${SPEED_WALLET_SECRET_KEY}`).toString('base64');
 
 // Speed wallet payout mappings - EXACTLY matching bet amounts to winnings
@@ -125,7 +134,7 @@ async function resolveLightningAddress(address, amountSats) {
     const lnurl = `https://${domain}/.well-known/lnurlp/${username}`;
     console.log('Fetching LNURL metadata from:', lnurl);
 
-    const metadataResponse = await axios.get(lnurl, { timeout: 5000 });
+    const metadataResponse = await httpClient.get(lnurl, { timeout: 5000 });
     const metadata = metadataResponse.data;
     console.log('Received LNURL metadata:', metadata);
 
@@ -143,7 +152,7 @@ async function resolveLightningAddress(address, amountSats) {
     }
 
     const callback = metadata.callback;
-    const invoiceResponse = await axios.get(`${callback}?amount=${amountMsats}`, { timeout: 5000 });
+    const invoiceResponse = await httpClient.get(`${callback}?amount=${amountMsats}`, { timeout: 5000 });
     const invoice = invoiceResponse.data.pr;
 
     if (!invoice) {
@@ -169,7 +178,7 @@ async function createLightningInvoice(amountSats, customerId, orderId, metadata 
       metadata,
     };
 
-    const response = await axios.post(
+    const response = await httpClient.post(
       `${SPEED_API_BASE}/payments`,
       payload,
       {
@@ -233,7 +242,7 @@ async function sendInstantPayment(withdrawRequest, amount, note = '') {
       note: note
     };
 
-    const response = await axios.post(
+    const response = await httpClient.post(
       `${SPEED_API_BASE}/send`,
       instantSendPayload,
       {
@@ -277,7 +286,7 @@ async function fetchLightningAddress(authToken) {
     console.log('Fetching Lightning address with token:', authToken.substring(0, 10) + '...');
     
     // Use Speed wallet user endpoint
-    const response = await axios.get(
+    const response = await httpClient.get(
       `${SPEED_API_BASE}/user`,
       {
         headers: {
@@ -331,7 +340,7 @@ async function processPayout(winnerId, betAmount, gameId) {
     io.to(winnerId).emit('payment_sent', {
       amount: winAmount,
       status: 'success',
-      txId: result.id || 'demo'
+      txId: result?.id || null
     });
     
     console.log('Payout processed successfully');
