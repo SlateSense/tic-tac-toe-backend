@@ -65,12 +65,11 @@ app.use(express.json({
 }));
 
 // Constants
-const DEMO_MODE = process.env.DEMO_MODE === 'true'; // Default to false for production
 const SPEED_WALLET_SECRET_KEY = process.env.SPEED_WALLET_SECRET_KEY || '';
 const SPEED_WALLET_WEBHOOK_SECRET = process.env.SPEED_WALLET_WEBHOOK_SECRET || '';
 
-if (!DEMO_MODE && (!SPEED_WALLET_SECRET_KEY || !SPEED_WALLET_WEBHOOK_SECRET)) {
-  console.error('Missing Speed Wallet secrets. Set SPEED_WALLET_SECRET_KEY and SPEED_WALLET_WEBHOOK_SECRET or enable DEMO_MODE=true.');
+if (!SPEED_WALLET_SECRET_KEY || !SPEED_WALLET_WEBHOOK_SECRET) {
+  console.error('Missing Speed Wallet secrets. Set SPEED_WALLET_SECRET_KEY and SPEED_WALLET_WEBHOOK_SECRET.');
   process.exit(1);
 }
 
@@ -157,14 +156,6 @@ async function resolveLightningAddress(address, amountSats) {
 
 // Create a Lightning invoice via Speed Wallet
 async function createLightningInvoice(amountSats, customerId, orderId, metadata = {}) {
-  if (DEMO_MODE) {
-    const invoiceId = `demo_${uuidv4()}`;
-    const lightningInvoice = `lnbc_demo_${invoiceId}`;
-    const hostedInvoiceUrl = `https://demo.speed.app/i/${invoiceId}`;
-    const amountUSD = Number((Number(amountSats) * 0.0006).toFixed(2));
-    return { invoiceId, lightningInvoice, hostedInvoiceUrl, amountSats, amountUSD, demo: true };
-  }
-
   try {
     const payload = {
       amount: parseFloat(amountSats),
@@ -213,11 +204,6 @@ async function createLightningInvoice(amountSats, customerId, orderId, metadata 
 // Send instant payment using Speed wallet API
 async function sendInstantPayment(withdrawRequest, amount, note = '') {
   try {
-    if (DEMO_MODE) {
-      console.log('DEMO MODE: Simulating payment of', amount, 'SATS to', withdrawRequest);
-      return { success: true, demo: true, amount };
-    }
-
     console.log('Sending instant payment via Speed Wallet:', {
       withdrawRequest,
       amount,
@@ -266,6 +252,18 @@ async function sendInstantPayment(withdrawRequest, amount, note = '') {
   }
 }
 
+// Fetch Speed wallet transactions (mock/demo friendly)
+async function fetchSpeedWalletTransactions(lightningAddress) {
+  try {
+    // Placeholder for real API call if/when Speed exposes this
+    // Returning empty list to avoid misleading data
+    return [];
+  } catch (e) {
+    console.error('fetchSpeedWalletTransactions error:', e.message);
+    return [];
+  }
+}
+
 // Fetch user's Lightning address from Speed wallet
 async function fetchLightningAddress(authToken) {
   try {
@@ -293,10 +291,6 @@ async function fetchLightningAddress(authToken) {
     return lightningAddress;
   } catch (error) {
     console.error('Error fetching Lightning address:', error.message);
-    // Fallback to demo address in demo mode
-    if (DEMO_MODE) {
-      return `demo_${Date.now()}@speed.app`;
-    }
     throw error;
   }
 }
@@ -528,9 +522,39 @@ app.get('/api/payouts', (req, res) => {
   res.json(PAYOUTS);
 });
 
+// Sea Battle compatible payout-info endpoint
+app.get('/api/payout-info', (req, res) => {
+  res.json({
+    api: {
+      name: 'Speed Wallet API',
+      endpoint: SPEED_API_BASE,
+      method: 'Lightning Network instant payments',
+      description: "Winners are paid instantly via Lightning Network using Speed Wallet's send API"
+    },
+    payouts: PAYOUTS,
+    fees: 'Platform fees are automatically deducted from the total pot',
+    currency: 'SATS (Bitcoin Satoshis)',
+    paymentMethod: 'Lightning Address (@speed.app)'
+  });
+});
+
+// Proxy endpoint to fetch Speed wallet transactions (mock/demo compatible)
+app.get('/api/speed-transactions/:lightning_address', async (req, res) => {
+  try {
+    const { lightning_address } = req.params;
+    if (!lightning_address) return res.status(400).json({ error: 'Lightning address is required' });
+
+    const transactions = await fetchSpeedWalletTransactions(lightning_address);
+    res.json({ lightning_address, transactions, timestamp: new Date().toISOString() });
+  } catch (e) {
+    console.error('Speed transactions error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch Speed wallet transactions' });
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', demoMode: DEMO_MODE });
+  res.json({ status: 'ok' });
 });
 
 // Speed Wallet Webhook: verify and handle payment events
@@ -539,12 +563,10 @@ app.post('/webhook', webhookLimiter, webhookQueue, (req, res) => {
     const signature = req.headers['speed-signature'] || req.headers['speed_signature'] || req.headers['speed-signature-v1'];
     const raw = req.rawBody || JSON.stringify(req.body || {});
 
-    if (!DEMO_MODE) {
-      if (!signature) return res.status(400).send('Missing signature');
-      const expected = crypto.createHmac('sha256', SPEED_WALLET_WEBHOOK_SECRET).update(raw).digest('hex');
-      const valid = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature)));
-      if (!valid) return res.status(400).send('Invalid signature');
-    }
+    if (!signature) return res.status(400).send('Missing signature');
+    const expected = crypto.createHmac('sha256', SPEED_WALLET_WEBHOOK_SECRET).update(raw).digest('hex');
+    const valid = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature)));
+    if (!valid) return res.status(400).send('Invalid signature');
 
     const event = req.body || {};
     const type = event.event_type || event.type;
@@ -838,21 +860,15 @@ io.on('connection', (socket) => {
 
       // Create invoice and map to socket
       const orderId = `ttt_${uuidv4()}`;
-      const { invoiceId, lightningInvoice, hostedInvoiceUrl, amountSats, amountUSD, demo } = await createLightningInvoice(betAmount, null, orderId, { socketId: socket.id, betAmount });
+      const { invoiceId, lightningInvoice, hostedInvoiceUrl, amountSats, amountUSD } = await createLightningInvoice(betAmount, null, orderId, { socketId: socket.id, betAmount });
       invoiceToSocket[invoiceId] = socket.id;
       invoiceMeta[invoiceId] = { betAmount, lightningAddress: addr };
 
-      socket.emit('paymentRequest', { invoiceId, lightningInvoice, hostedInvoiceUrl, amountSats, amountUSD, demo: !!demo });
+      socket.emit('paymentRequest', { invoiceId, lightningInvoice, hostedInvoiceUrl, amountSats, amountUSD });
     } catch (err) {
       console.error('joinGame error:', err.message);
       socket.emit('error', { message: 'Could not create payment request' });
     }
-  });
-
-  socket.on('simulatePayment', ({ invoiceId }) => {
-    if (!DEMO_MODE) return;
-    if (!invoiceId || !invoiceToSocket[invoiceId]) return;
-    handleInvoicePaid(invoiceId, { demo: true });
   });
   
   // Handle moves
@@ -968,5 +984,4 @@ function handleDraw(gameId) {
 const PORT = process.env.PORT || process.env.BACKEND_PORT || 3001;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Tic-Tac-Toe backend running on port ${PORT}`);
-  console.log(`Demo mode: ${DEMO_MODE}`);
 });
