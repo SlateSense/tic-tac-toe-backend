@@ -50,8 +50,15 @@ const logger = winston.createLogger({
 try { dns.setDefaultResultOrder('ipv4first'); } catch (e) {}
 const ipv4Lookup = (hostname, options, cb) => dns.lookup(hostname, { family: 4, all: false }, cb);
 const httpAgent = new http.Agent({ keepAlive: true, lookup: ipv4Lookup });
-const httpsAgent = new https.Agent({ keepAlive: true, lookup: ipv4Lookup });
-const httpClient = axios.create({ httpAgent, httpsAgent });
+const httpsAgent = new https.Agent({ keepAlive: true, lookup: ipv4Lookup, rejectUnauthorized: true });
+const httpClient = axios.create({ 
+  httpAgent, 
+  httpsAgent,
+  timeout: 10000,
+  headers: {
+    'User-Agent': 'TicTacToe/1.0'
+  }
+});
 
 const app = express();
 // Trust the first proxy hop (common for cloud platforms like Render/Heroku)
@@ -94,8 +101,8 @@ const webhookLimiter = rateLimit({
 });
 const webhookQueue = Queue({ activeLimit: 1, queuedLimit: -1 });
 
-const SPEED_WALLET_API_BASE = process.env.SPEED_WALLET_API_BASE || 'https://api.speed.app/v1';
-const SPEED_API_BASE = process.env.SPEED_API_BASE || 'https://api.speed.app/2022-04-15';
+const SPEED_WALLET_API_BASE = process.env.SPEED_WALLET_API_BASE || 'https://api.tryspeed.com';
+const SPEED_API_BASE = process.env.SPEED_API_BASE || 'https://api.tryspeed.com';
 const AUTH_HEADER = Buffer.from(`:${SPEED_WALLET_SECRET_KEY}`).toString('base64');
 
 // Speed wallet payout mappings - EXACTLY matching bet amounts to winnings
@@ -161,23 +168,41 @@ async function resolveLightningAddress(address, amountSats) {
 
     return invoice;
   } catch (error) {
-    console.error('Error resolving Lightning address:', error.message);
-    throw error;
+    const errorMessage = error.response?.data?.errors?.[0]?.message || error.message;
+    const errorStatus = error.response?.status || 'No status';
+    const errorDetails = error.response?.data || error.message;
+    console.error('Create Invoice Error:', {
+      message: errorMessage,
+      status: errorStatus,
+      details: errorDetails,
+    });
+    throw new Error(`Failed to create invoice: ${errorMessage} (Status: ${errorStatus})`);
   }
 }
 
 // Create a Lightning invoice via Speed Wallet
 async function createLightningInvoice(amountSats, customerId, orderId, metadata = {}) {
   try {
+    console.log('Creating Lightning invoice using Speed API:', { amountSats, customerId, orderId });
+    
+    // Use the new payments API with Speed Wallet interface - request payment directly in SATS
     const payload = {
-      amount: parseFloat(amountSats),
       currency: 'SATS',
-      payment_method: 'lightning',
-      customer_id: customerId,
-      order_id: orderId,
-      metadata,
+      amount: amountSats,
+      target_currency: 'SATS',
+      ttl: 600, // 10 minutes for payment
+      description: `Tic-Tac-Toe Game - ${amountSats} SATS`,
+      metadata: {
+        Order_ID: orderId,
+        Customer_ID: customerId,
+        Game_Type: 'Tic_Tac_Toe',
+        Amount_SATS: amountSats.toString(),
+        ...metadata
+      }
     };
 
+    console.log('Creating payment with Speed API payload:', payload);
+    
     const response = await httpClient.post(
       `${SPEED_API_BASE}/payments`,
       payload,
@@ -185,27 +210,41 @@ async function createLightningInvoice(amountSats, customerId, orderId, metadata 
         headers: {
           Authorization: `Basic ${AUTH_HEADER}`,
           'Content-Type': 'application/json',
-          'speed-version': '2022-04-15',
         },
         timeout: 10000,
       }
     );
 
-    const data = response.data || {};
-    const invoiceId = data.id || data.payment?.id || data.payment_intent_id;
-    const lightningInvoice = data.payment_method_options?.lightning?.payment_request
-      || data.lightning_invoice
-      || data.invoice
-      || data.payment_request
-      || data.bolt11;
-    const hostedInvoiceUrl = data.hosted_invoice_url || data.hosted_checkout_url || data.checkout_url || null;
-    const amountUSD = data.amount_usd || Number((Number(amountSats) * 0.0006).toFixed(2));
-
-    if (!invoiceId || !lightningInvoice) {
-      throw new Error('Speed API did not return an invoice');
+    console.log('Speed API response:', response.data);
+    
+    // Extract payment details from Speed API response
+    const paymentData = response.data;
+    const invoiceId = paymentData.id;
+    const hostedInvoiceUrl = paymentData.hosted_invoice_url || paymentData.hosted_checkout_url || paymentData.checkout_url || null;
+    
+    // Extract Lightning invoice from various possible locations
+    let lightningInvoice = paymentData.payment_method_options?.lightning?.payment_request ||
+                          paymentData.lightning_invoice || 
+                          paymentData.invoice || 
+                          paymentData.payment_request ||
+                          paymentData.bolt11;
+    
+    if (!lightningInvoice && hostedInvoiceUrl) {
+      console.log('No direct Lightning invoice found, will use hosted URL');
+      lightningInvoice = hostedInvoiceUrl;
     }
 
-    return { invoiceId, lightningInvoice, hostedInvoiceUrl, amountSats, amountUSD };
+    if (!invoiceId) {
+      throw new Error('No invoice ID returned from Speed API');
+    }
+
+    return {
+      invoiceId,
+      hostedInvoiceUrl,
+      lightningInvoice,
+      amountSats,
+      speedInterfaceUrl: hostedInvoiceUrl // This will open Speed Wallet interface
+    };
   } catch (error) {
     const errorMessage = error.response?.data?.errors?.[0]?.message || error.message;
     console.error('Create Invoice Error:', errorMessage);
