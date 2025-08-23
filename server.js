@@ -305,7 +305,7 @@ async function createLightningInvoice(amountSats, customerId, orderId) {
 
   async function attemptCreate(header, label, extraHeaders = {}) {
     console.log(`Creating Lightning invoice via Speed (${label})`, { amountSats, orderId, mode });
-    const resp = await httpClient.post(`${SPEED_API_BASE}/payments`, payload, {
+    const resp = await axios.post(`${SPEED_API_BASE}/payments`, payload, {
       headers: {
         Authorization: `Basic ${header}`,
         'Content-Type': 'application/json',
@@ -345,29 +345,15 @@ async function createLightningInvoice(amountSats, customerId, orderId) {
     };
   }
 
-  // 1) Try publishable key first (no IP whitelist required)
-  if (tryPublishable && PUB_AUTH_HEADER) {
+  // Only use publishable key (no IP whitelist required)
+  if (PUB_AUTH_HEADER) {
     try {
       return await attemptCreate(PUB_AUTH_HEADER, 'publishable');
     } catch (error) {
       const status = error.response?.status;
       const msg = error.response?.data?.errors?.[0]?.message || error.message;
-      console.warn(`Publishable invoice attempt failed (${status || 'n/a'}): ${msg}`);
-      const shouldFallback = trySecret && [401, 403, 422].includes(Number(status));
-      if (!shouldFallback) {
-        throw new Error(`Failed to create invoice (publishable): ${msg} (Status: ${status || 'n/a'})`);
-      }
-    }
-  }
-
-  // 2) Fallback to secret key (pre-migration behavior; may require IP whitelist)
-  if (trySecret) {
-    try {
-      return await attemptCreate(AUTH_HEADER, 'secret', { 'speed-version': '2022-04-15' });
-    } catch (error) {
-      const status = error.response?.status;
-      const msg = error.response?.data?.errors?.[0]?.message || error.message;
-      throw new Error(`Failed to create invoice (secret): ${msg} (Status: ${status || 'n/a'})`);
+      console.error(`Publishable invoice failed:`, error.response?.data || error.message);
+      throw new Error(`Failed to create invoice: ${msg} (Status: ${status || 'n/a'})`);
     }
   }
 
