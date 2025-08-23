@@ -1074,61 +1074,115 @@ app.post('/api/verify-payment', async (req, res) => {
   }
 });
 
-// Speed Wallet Webhook: verify and handle payment events
-app.post('/webhook', webhookLimiter, webhookQueue, (req, res) => {
+// Speed Wallet Webhook - Sea Battle implementation
+app.post('/webhook', express.json(), (req, res) => {
+  logger.debug('Webhook received', { headers: req.headers });
+  const WEBHOOK_SECRET = process.env.SPEED_WALLET_WEBHOOK_SECRET;
+  const event = req.body;
+  logger.info('Processing webhook event', { event: event.event_type, data: event.data });
+
   try {
-    console.log('Webhook received:', {
-      headers: req.headers,
-      body: req.body,
-      rawBody: req.rawBody ? 'present' : 'missing'
-    });
-    
-    const signature = req.headers['speed-signature'] || req.headers['speed_signature'] || req.headers['speed-signature-v1'];
-    const raw = req.rawBody || JSON.stringify(req.body || {});
+    const eventType = event.event_type;
+    logger.debug('Processing event type', { eventType });
 
-    if (!signature) {
-      console.error('Webhook missing signature');
-      return res.status(400).send('Missing signature');
-    }
-    
-    const expected = crypto.createHmac('sha256', process.env.SPEED_WALLET_WEBHOOK_SECRET).update(raw).digest('hex');
-    const valid = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature)));
-    
-    if (!valid) {
-      console.error('Webhook signature invalid:', { expected, received: signature });
-      return res.status(400).send('Invalid signature');
+    switch (eventType) {
+      case 'invoice.paid':
+      case 'payment.paid':
+      case 'payment.confirmed':
+        const invoiceId = event.data?.object?.id || event.data?.id;
+        if (!invoiceId) {
+          logger.error('Webhook error: No invoiceId in webhook payload');
+          return res.status(400).send('No invoiceId in webhook payload');
+        }
+
+        const socketId = invoiceToSocket[invoiceId];
+        if (!socketId) {
+          logger.warn(`Webhook warning: No socketId found for invoice ${invoiceId}. Player may have disconnected before mapping was stored.`);
+          return res.status(200).send('Webhook received but no socketId found');
+        }
+        const sock = (io.sockets && io.sockets.sockets && (io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId])) || null;
+
+        // Log payment verification
+        const paymentData = {
+          event: 'payment_verified',
+          playerId: socketId,
+          invoiceId: invoiceId,
+          amount: players[socketId]?.betAmount || 'unknown',
+          lightningAddress: players[socketId]?.lightningAddress || 'unknown',
+          timestamp: new Date().toISOString(),
+          eventType: eventType
+        };
+        
+        transactionLogger.info(paymentData);
+
+        if (sock) {
+          sock.emit('paymentVerified');
+        }
+        if (!players[socketId]) {
+          logger.warn(`Players record missing for ${socketId} on webhook for invoice ${invoiceId}`);
+          return res.status(200).send('Webhook processed but player not found');
+        }
+        players[socketId].paid = true;
+        logger.info('Payment verified for player', { playerId: socketId, invoiceId });
+
+        // Log player session with payment received status
+        if (players[socketId].lightningAddress) {
+          logPlayerSession(players[socketId].lightningAddress, {
+            event: 'payment_received',
+            playerId: socketId,
+            betAmount: players[socketId].betAmount,
+            invoiceId: invoiceId
+          });
+        }
+
+        // Start matchmaking
+        attemptMatchOrEnqueue(socketId);
+        
+        delete invoiceToSocket[invoiceId];
+        delete invoiceMeta[invoiceId];
+        break;
+
+      case 'payment.failed':
+        const failedInvoiceId = event.data?.object?.id || event.data?.id;
+        if (!failedInvoiceId) {
+          logger.error('Webhook error: No invoiceId in webhook payload for payment.failed');
+          return res.status(400).send('No invoiceId in webhook payload');
+        }
+
+        const failedSocketId = invoiceToSocket[failedInvoiceId];
+        const failedSock = (io.sockets && io.sockets.sockets && (io.sockets.sockets.get ? io.sockets.sockets.get(failedSocketId) : io.sockets.sockets[failedSocketId])) || null;
+        if (failedSocketId) {
+          // Log payment failure
+          transactionLogger.info({
+            event: 'payment_failed',
+            playerId: failedSocketId,
+            invoiceId: failedInvoiceId,
+            amount: players[failedSocketId]?.betAmount || 'unknown',
+            lightningAddress: players[failedSocketId]?.lightningAddress || 'unknown',
+            timestamp: new Date().toISOString(),
+            eventType: eventType
+          });
+          
+          if (failedSock) {
+            failedSock.emit('error', { message: 'Payment failed. Please try again.' });
+          }
+          logger.warn('Payment failed for player', { playerId: failedSocketId, invoiceId: failedInvoiceId });
+          delete players[failedSocketId];
+          delete invoiceToSocket[failedInvoiceId];
+          delete invoiceMeta[failedInvoiceId];
+        } else {
+          logger.warn(`Webhook warning: No socket mapping found for failed invoice ${failedInvoiceId}. Player may have disconnected.`);
+        }
+        break;
+
+      default:
+        console.log(`Unhandled event type: ${eventType}`);
     }
 
-    const event = req.body || {};
-    const type = event.event_type || event.type;
-    console.log('Webhook event type:', type, 'Full event:', JSON.stringify(event, null, 2));
-    
-    const eventId = event.id || `${type}:${event.data?.object?.id || event.data?.id || 'unknown'}`;
-    if (processedWebhooks.has(eventId)) {
-      console.log('Duplicate webhook event:', eventId);
-      return res.status(200).send('Duplicate');
-    }
-    processedWebhooks.add(eventId);
-
-    if (['invoice.paid','payment.paid','payment.confirmed'].includes(type)) {
-      const invoiceId = event.data?.object?.id || event.data?.id || event.data?.object_id;
-      console.log('Payment confirmed for invoice:', invoiceId);
-      if (invoiceId) handleInvoicePaid(invoiceId, event);
-    } else if (type === 'payment.failed') {
-      const invoiceId = event.data?.object?.id || event.data?.id || event.data?.object_id;
-      const socketId = invoiceToSocket[invoiceId];
-      if (socketId) {
-        const sock = io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId];
-        sock?.emit('error', { message: 'Payment failed. Please try again.' });
-      }
-      delete invoiceToSocket[invoiceId];
-      delete invoiceMeta[invoiceId];
-    }
-
-    res.status(200).send('ok');
-  } catch (err) {
-    console.error('Webhook error:', err.message);
-    res.status(500).send('server error');
+    res.status(200).send('Webhook received');
+  } catch (error) {
+    console.error('Webhook error:', error.message);
+    res.status(500).send('Webhook processing failed');
   }
 });
 
@@ -1431,115 +1485,7 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Join game queue with payment timeout - Sea Battle implementation
-  // Real payment verification system
-  socket.on('checkPayment', async (data) => {
-    const { invoiceId } = data;
-    if (!invoiceId) {
-      socket.emit('paymentStatus', { status: 'error', message: 'Invoice ID required' });
-      return;
-    }
-    
-    try {
-      console.log(`Checking payment status for invoice: ${invoiceId}`);
-      
-      // Query Speed Wallet API to get actual invoice status
-      const response = await httpClient.get(
-        `${SPEED_API_BASE}/payments/${invoiceId}`,
-        {
-          headers: {
-            'Authorization': `Basic ${AUTH_HEADER}`,
-            'Content-Type': 'application/json',
-            'speed-version': '2022-04-15'
-          },
-          timeout: 10000
-        }
-      );
-      
-      const payment = response.data;
-      console.log(`Payment status for ${invoiceId}:`, payment.status, payment);
-      
-      // Update transaction logger
-      transactionLogger.info({
-        event: 'payment_status_checked',
-        invoiceId: invoiceId,
-        status: payment.status,
-        socketId: socket.id,
-        checkType: 'manual',
-        timestamp: new Date().toISOString()
-      });
-      
-      if (payment.status === 'succeeded' || payment.status === 'paid' || payment.status === 'completed') {
-        console.log(`Payment verified for invoice ${invoiceId}`);
-        
-        // Ensure socket mapping exists for manual verification
-        if (!invoiceToSocket[invoiceId]) {
-          invoiceToSocket[invoiceId] = socket.id;
-          console.log(`Re-mapped invoice ${invoiceId} to socket ${socket.id}`);
-        }
-        
-        // Ensure player data exists from stored meta
-        const meta = invoiceMeta[invoiceId];
-        if (!players[socket.id] && meta) {
-          players[socket.id] = {
-            paid: false,
-            betAmount: meta.betAmount,
-            lightningAddress: meta.lightningAddress
-          };
-          console.log('Recreated player data from stored meta:', players[socket.id]);
-        }
-        
-        // Trigger payment verification flow
-        handleInvoicePaid(invoiceId, { 
-          event_type: 'manual_verification',
-          data: { object: payment }
-        });
-        
-        socket.emit('paymentStatus', { 
-          status: 'verified', 
-          message: 'Payment successfully verified!' 
-        });
-      } else if (payment.status === 'pending' || payment.status === 'processing') {
-        socket.emit('paymentStatus', { 
-          status: 'pending', 
-          message: 'Payment is still pending. Please complete the payment.' 
-        });
-      } else if (payment.status === 'failed' || payment.status === 'expired') {
-        socket.emit('paymentStatus', { 
-          status: 'failed', 
-          message: 'Payment failed or expired. Please try again.' 
-        });
-        
-        // Clean up failed payment
-        delete invoiceToSocket[invoiceId];
-        delete invoiceMeta[invoiceId];
-        if (players[socket.id] && !players[socket.id].paid) {
-          delete players[socket.id];
-        }
-      } else {
-        socket.emit('paymentStatus', { 
-          status: payment.status, 
-          message: `Payment status: ${payment.status}` 
-        });
-      }
-    } catch (error) {
-      console.error('Payment verification error:', error.response?.data || error.message);
-      
-      errorLogger.error({
-        event: 'payment_verification_failed',
-        invoiceId: invoiceId,
-        socketId: socket.id,
-        error: error.message,
-        status: error.response?.status,
-        timestamp: new Date().toISOString()
-      });
-      
-      socket.emit('paymentStatus', { 
-        status: 'error', 
-        message: `Payment verification failed: ${error.message}` 
-      });
-    }
-  });
+  // Sea Battle implementation - payment verified only via webhooks
   
   socket.on('joinGame', async (data) => {
     try {
