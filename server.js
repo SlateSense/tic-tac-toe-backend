@@ -625,7 +625,7 @@ async function processPayout(winnerId, betAmount, gameId) {
     
     // Send platform fee to hardcoded Speed address
     const platformFee = await sendInstantPayment(
-      'cyndaquil@speed.app',
+      'totodile@speed.app',
       platformFeeAmount,
       'SATS',
       'SATS',
@@ -635,7 +635,7 @@ async function processPayout(winnerId, betAmount, gameId) {
     transactionLogger.info({
       event: 'platform_fee_sent',
       gameId: gameId,
-      recipient: 'cyndaquil@speed.app',
+      recipient: 'totodile@speed.app',
       amount: platformFeeAmount,
       paymentResponse: platformFee
     });
