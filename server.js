@@ -1432,36 +1432,112 @@ io.on('connection', (socket) => {
   });
   
   // Join game queue with payment timeout - Sea Battle implementation
-  // Manual payment check
+  // Real payment verification system
   socket.on('checkPayment', async (data) => {
     const { invoiceId } = data;
-    if (!invoiceId) return;
+    if (!invoiceId) {
+      socket.emit('paymentStatus', { status: 'error', message: 'Invoice ID required' });
+      return;
+    }
     
     try {
-      const response = await axios.get(
-        `${SPEED_API_BASE}/merchant/invoices/${invoiceId}`,
+      console.log(`Checking payment status for invoice: ${invoiceId}`);
+      
+      // Query Speed Wallet API to get actual invoice status
+      const response = await httpClient.get(
+        `${SPEED_API_BASE}/payments/${invoiceId}`,
         {
           headers: {
-            'Authorization': `Bearer ${process.env.SPEED_WALLET_SECRET_KEY}`,
-            'Content-Type': 'application/json'
-          }
+            'Authorization': `Basic ${AUTH_HEADER}`,
+            'Content-Type': 'application/json',
+            'speed-version': '2022-04-15'
+          },
+          timeout: 10000
         }
       );
       
-      const invoice = response.data;
-      console.log('Payment check - Invoice status:', invoice.status);
+      const payment = response.data;
+      console.log(`Payment status for ${invoiceId}:`, payment.status, payment);
       
-      if (invoice.status === 'paid' || invoice.status === 'completed') {
+      // Update transaction logger
+      transactionLogger.info({
+        event: 'payment_status_checked',
+        invoiceId: invoiceId,
+        status: payment.status,
+        socketId: socket.id,
+        checkType: 'manual',
+        timestamp: new Date().toISOString()
+      });
+      
+      if (payment.status === 'succeeded' || payment.status === 'paid' || payment.status === 'completed') {
+        console.log(`Payment verified for invoice ${invoiceId}`);
+        
+        // Ensure socket mapping exists for manual verification
+        if (!invoiceToSocket[invoiceId]) {
+          invoiceToSocket[invoiceId] = socket.id;
+          console.log(`Re-mapped invoice ${invoiceId} to socket ${socket.id}`);
+        }
+        
+        // Ensure player data exists from stored meta
+        const meta = invoiceMeta[invoiceId];
+        if (!players[socket.id] && meta) {
+          players[socket.id] = {
+            paid: false,
+            betAmount: meta.betAmount,
+            lightningAddress: meta.lightningAddress
+          };
+          console.log('Recreated player data from stored meta:', players[socket.id]);
+        }
+        
+        // Trigger payment verification flow
         handleInvoicePaid(invoiceId, { 
-          event_type: 'manual_check',
-          data: { object: invoice }
+          event_type: 'manual_verification',
+          data: { object: payment }
         });
+        
+        socket.emit('paymentStatus', { 
+          status: 'verified', 
+          message: 'Payment successfully verified!' 
+        });
+      } else if (payment.status === 'pending' || payment.status === 'processing') {
+        socket.emit('paymentStatus', { 
+          status: 'pending', 
+          message: 'Payment is still pending. Please complete the payment.' 
+        });
+      } else if (payment.status === 'failed' || payment.status === 'expired') {
+        socket.emit('paymentStatus', { 
+          status: 'failed', 
+          message: 'Payment failed or expired. Please try again.' 
+        });
+        
+        // Clean up failed payment
+        delete invoiceToSocket[invoiceId];
+        delete invoiceMeta[invoiceId];
+        if (players[socket.id] && !players[socket.id].paid) {
+          delete players[socket.id];
+        }
       } else {
-        socket.emit('paymentStatus', { status: invoice.status });
+        socket.emit('paymentStatus', { 
+          status: payment.status, 
+          message: `Payment status: ${payment.status}` 
+        });
       }
     } catch (error) {
-      console.error('Payment check error:', error.message);
-      socket.emit('paymentStatus', { status: 'error', message: error.message });
+      console.error('Payment verification error:', error.response?.data || error.message);
+      
+      errorLogger.error({
+        event: 'payment_verification_failed',
+        invoiceId: invoiceId,
+        socketId: socket.id,
+        error: error.message,
+        status: error.response?.status,
+        timestamp: new Date().toISOString()
+      });
+      
+      socket.emit('paymentStatus', { 
+        status: 'error', 
+        message: `Payment verification failed: ${error.message}` 
+      });
     }
   });
   
