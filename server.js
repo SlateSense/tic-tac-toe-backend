@@ -345,15 +345,32 @@ async function createLightningInvoice(amountSats, customerId, orderId) {
     };
   }
 
-  // Only use publishable key (no IP whitelist required)
-  if (PUB_AUTH_HEADER) {
+  // Try publishable mode first if configured
+  if (tryPublishable && PUB_AUTH_HEADER) {
     try {
       return await attemptCreate(PUB_AUTH_HEADER, 'publishable');
     } catch (error) {
       const status = error.response?.status;
       const msg = error.response?.data?.errors?.[0]?.message || error.message;
       console.error(`Publishable invoice failed:`, error.response?.data || error.message);
-      throw new Error(`Failed to create invoice: ${msg} (Status: ${status || 'n/a'})`);
+      
+      // Check if we should fallback to secret mode
+      const shouldFallback = trySecret && [401, 403, 422].includes(Number(status));
+      if (!shouldFallback) {
+        throw new Error(`Failed to create invoice (publishable): ${msg} (Status: ${status || 'n/a'})`);
+      }
+      console.log('Falling back to secret mode due to publishable failure');
+    }
+  }
+
+  // Try secret mode if configured
+  if (trySecret && AUTH_HEADER) {
+    try {
+      return await attemptCreate(AUTH_HEADER, 'secret', { 'speed-version': '2022-04-15' });
+    } catch (error) {
+      const status = error.response?.status;
+      const msg = error.response?.data?.errors?.[0]?.message || error.message;
+      throw new Error(`Failed to create invoice (secret): ${msg} (Status: ${status || 'n/a'})`);
     }
   }
 
