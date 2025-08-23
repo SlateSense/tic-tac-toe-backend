@@ -151,6 +151,17 @@ app.use(express.json({
   }
 }));
 
+app.use('/webhook', express.raw({ type: 'application/json' }), (req, res, next) => {
+  req.rawBody = req.body.toString('utf8');
+  try {
+    req.body = JSON.parse(req.rawBody);
+  } catch (e) {
+    console.error('Failed to parse webhook body:', e);
+    req.body = {};
+  }
+  next();
+});
+
 if (!process.env.SPEED_WALLET_SECRET_KEY || !process.env.SPEED_WALLET_WEBHOOK_SECRET) {
   console.error('Missing Speed Wallet secrets. Set SPEED_WALLET_SECRET_KEY and SPEED_WALLET_WEBHOOK_SECRET.');
   process.exit(1);
@@ -1023,25 +1034,85 @@ app.post('/api/generate-qr', async (req, res) => {
   }
 });
 
+// Manual payment verification endpoint for testing
+app.post('/api/verify-payment', async (req, res) => {
+  try {
+    const { invoiceId } = req.body;
+    if (!invoiceId) {
+      return res.status(400).json({ error: 'Invoice ID required' });
+    }
+    
+    console.log('Manual payment verification requested for invoice:', invoiceId);
+    
+    // Check invoice status with Speed Wallet API
+    const response = await axios.get(
+      `${SPEED_API_BASE}/merchant/invoices/${invoiceId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.SPEED_WALLET_SECRET_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    const invoice = response.data;
+    console.log('Invoice status:', invoice.status, 'Invoice data:', invoice);
+    
+    if (invoice.status === 'paid' || invoice.status === 'completed') {
+      // Manually trigger payment verification
+      handleInvoicePaid(invoiceId, { 
+        event_type: 'manual_verification',
+        data: { object: invoice }
+      });
+      return res.json({ success: true, status: invoice.status });
+    } else {
+      return res.json({ success: false, status: invoice.status });
+    }
+  } catch (error) {
+    console.error('Manual payment verification error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to verify payment' });
+  }
+});
+
 // Speed Wallet Webhook: verify and handle payment events
 app.post('/webhook', webhookLimiter, webhookQueue, (req, res) => {
   try {
+    console.log('Webhook received:', {
+      headers: req.headers,
+      body: req.body,
+      rawBody: req.rawBody ? 'present' : 'missing'
+    });
+    
     const signature = req.headers['speed-signature'] || req.headers['speed_signature'] || req.headers['speed-signature-v1'];
     const raw = req.rawBody || JSON.stringify(req.body || {});
 
-    if (!signature) return res.status(400).send('Missing signature');
+    if (!signature) {
+      console.error('Webhook missing signature');
+      return res.status(400).send('Missing signature');
+    }
+    
     const expected = crypto.createHmac('sha256', process.env.SPEED_WALLET_WEBHOOK_SECRET).update(raw).digest('hex');
     const valid = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature)));
-    if (!valid) return res.status(400).send('Invalid signature');
+    
+    if (!valid) {
+      console.error('Webhook signature invalid:', { expected, received: signature });
+      return res.status(400).send('Invalid signature');
+    }
 
     const event = req.body || {};
     const type = event.event_type || event.type;
+    console.log('Webhook event type:', type, 'Full event:', JSON.stringify(event, null, 2));
+    
     const eventId = event.id || `${type}:${event.data?.object?.id || event.data?.id || 'unknown'}`;
-    if (processedWebhooks.has(eventId)) return res.status(200).send('Duplicate');
+    if (processedWebhooks.has(eventId)) {
+      console.log('Duplicate webhook event:', eventId);
+      return res.status(200).send('Duplicate');
+    }
     processedWebhooks.add(eventId);
 
     if (['invoice.paid','payment.paid','payment.confirmed'].includes(type)) {
       const invoiceId = event.data?.object?.id || event.data?.id || event.data?.object_id;
+      console.log('Payment confirmed for invoice:', invoiceId);
       if (invoiceId) handleInvoicePaid(invoiceId, event);
     } else if (type === 'payment.failed') {
       const invoiceId = event.data?.object?.id || event.data?.id || event.data?.object_id;
@@ -1062,17 +1133,35 @@ app.post('/webhook', webhookLimiter, webhookQueue, (req, res) => {
 });
 
 function handleInvoicePaid(invoiceId, event) {
+  console.log('handleInvoicePaid called for invoice:', invoiceId);
+  console.log('Current invoice mappings:', {
+    invoiceToSocket,
+    invoiceMeta
+  });
+  
   const socketId = invoiceToSocket[invoiceId];
-  if (!socketId) return;
+  if (!socketId) {
+    console.error('No socket found for invoice:', invoiceId);
+    return;
+  }
+  
   const meta = invoiceMeta[invoiceId] || {};
+  console.log('Payment meta data:', meta);
 
   players[socketId] = players[socketId] || {};
   players[socketId].paid = true;
   if (meta.betAmount) players[socketId].betAmount = meta.betAmount;
   if (meta.lightningAddress) players[socketId].lightningAddress = meta.lightningAddress;
 
+  console.log('Updated player data:', players[socketId]);
+
   const sock = io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId];
-  sock?.emit('paymentVerified');
+  if (sock) {
+    sock.emit('paymentVerified');
+    console.log('Emitted paymentVerified to socket:', socketId);
+  } else {
+    console.error('Socket not found for emission:', socketId);
+  }
   
   // Log payment verification
   transactionLogger.info({
@@ -1100,8 +1189,18 @@ function handleInvoicePaid(invoiceId, event) {
 }
 
 function attemptMatchOrEnqueue(socketId) {
+  console.log('attemptMatchOrEnqueue called for socket:', socketId);
   const player = players[socketId];
-  if (!player || !player.betAmount || !player.paid) return;
+  console.log('Player data:', player);
+  
+  if (!player || !player.betAmount || !player.paid) {
+    console.log('Player not ready for matching:', {
+      exists: !!player,
+      betAmount: player?.betAmount,
+      paid: player?.paid
+    });
+    return;
+  }
 
   // Try to find another paid player with the same bet
   const idx = waitingQueue.findIndex(p => p.betAmount === player.betAmount && p.socketId !== socketId);
@@ -1333,6 +1432,39 @@ io.on('connection', (socket) => {
   });
   
   // Join game queue with payment timeout - Sea Battle implementation
+  // Manual payment check
+  socket.on('checkPayment', async (data) => {
+    const { invoiceId } = data;
+    if (!invoiceId) return;
+    
+    try {
+      const response = await axios.get(
+        `${SPEED_API_BASE}/merchant/invoices/${invoiceId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${process.env.SPEED_WALLET_SECRET_KEY}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      
+      const invoice = response.data;
+      console.log('Payment check - Invoice status:', invoice.status);
+      
+      if (invoice.status === 'paid' || invoice.status === 'completed') {
+        handleInvoicePaid(invoiceId, { 
+          event_type: 'manual_check',
+          data: { object: invoice }
+        });
+      } else {
+        socket.emit('paymentStatus', { status: invoice.status });
+      }
+    } catch (error) {
+      console.error('Payment check error:', error.message);
+      socket.emit('paymentStatus', { status: 'error', message: error.message });
+    }
+  });
+  
   socket.on('joinGame', async (data) => {
     try {
       const { betAmount, lightningAddress, acctId } = data || {};
@@ -1369,6 +1501,12 @@ io.on('connection', (socket) => {
         `order_${socket.id}_${Date.now()}`
       );
       
+      console.log('Created invoice:', {
+        invoiceId: invoiceData.invoiceId,
+        socketId: socket.id,
+        betAmount: betAmount
+      });
+      
       const lightningInvoice = invoiceData.lightningInvoice;
       const hostedInvoiceUrl = invoiceData.hostedInvoiceUrl;
 
@@ -1393,8 +1531,14 @@ io.on('connection', (socket) => {
         socketId: socket.id,
         betAmount,
         lightningAddress: formattedAddress,
-        createdAt: new Date().toISOString()
+        createdAt: Date.now()
       };
+      
+      console.log('Mapped invoice to socket:', {
+        invoiceId: invoiceData.invoiceId,
+        socketId: socket.id,
+        mappings: { invoiceToSocket, invoiceMeta }
+      });
       
       // Log player session start
       logPlayerSession(formattedAddress, {
