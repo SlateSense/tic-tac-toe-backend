@@ -151,16 +151,6 @@ app.use(express.json({
   }
 }));
 
-app.use('/webhook', express.raw({ type: 'application/json' }), (req, res, next) => {
-  req.rawBody = req.body.toString('utf8');
-  try {
-    req.body = JSON.parse(req.rawBody);
-  } catch (e) {
-    console.error('Failed to parse webhook body:', e);
-    req.body = {};
-  }
-  next();
-});
 
 if (!process.env.SPEED_WALLET_SECRET_KEY || !process.env.SPEED_WALLET_WEBHOOK_SECRET) {
   console.error('Missing Speed Wallet secrets. Set SPEED_WALLET_SECRET_KEY and SPEED_WALLET_WEBHOOK_SECRET.');
@@ -580,87 +570,94 @@ async function fetchLightningAddress(authToken) {
 // Process payout for winner with platform fee - Sea Battle implementation
 async function processPayout(winnerId, betAmount, gameId) {
   try {
-    const game = games[gameId];
-    if (!game || game.status !== 'finished') return;
-    
-    const winner = game.players[winnerId];
-    if (!winner || winner.isBot) return;
-    
-    const payout = PAYOUTS[betAmount];
-    if (!payout) return;
-    
-    const winAmount = payout.winner;
-    const platformFeeAmount = payout.platformFee;
-    const lightningAddress = winner.lightningAddress;
-    
-    if (!lightningAddress) {
-      console.error('No Lightning address for winner');
-      return;
+    const winner = players[winnerId];
+    if (!winner || !winner.lightningAddress) {
+      throw new Error('Winner data not found');
     }
-    
-    console.log(`Processing payout: ${winAmount} SATS to ${lightningAddress}`);
-    transactionLogger.info({
-      event: 'payout_started',
-      gameId: gameId,
-      winnerId: winnerId,
-      winnerAddress: lightningAddress,
-      betAmount: betAmount,
-      winAmount: winAmount,
-      platformFee: platformFeeAmount
-    });
-    
-    // Send winner payment
-    const winnerPayment = await sendInstantPayment(
-      lightningAddress,
-      winAmount,
-      'SATS',
-      'SATS',
-      `Tic-Tac-Toe win - Game ${gameId} - Win: ${winAmount} SATS`
+
+    const totalPot = betAmount * 2;
+    const platformFee = Math.floor(totalPot * 0.05); // 5% platform fee
+    const winnerPayout = totalPot - platformFee;
+
+    console.log(`Processing payout for game ${gameId}:`);
+    console.log(`  Winner: ${winner.lightningAddress}`);
+    console.log(`  Total pot: ${totalPot} SATS`);
+    console.log(`  Platform fee: ${platformFee} SATS`);
+    console.log(`  Winner payout: ${winnerPayout} SATS`);
+
+    // Send winner payout
+    const winnerResult = await sendInstantPayment(
+      winner.lightningAddress,
+      winnerPayout,
+      `Tic-Tac-Toe winnings from game ${gameId}`
     );
-    
-    transactionLogger.info({
-      event: 'winner_payment_sent',
-      gameId: gameId,
-      winnerId: winnerId,
-      recipient: lightningAddress,
-      amount: winAmount,
-      paymentResponse: winnerPayment
-    });
-    
-    // Notify winner
-    io.to(winnerId).emit('payment_sent', {
-      amount: winAmount,
-      status: 'success',
-      txId: winnerPayment?.id || null
-    });
-    
-    // Send platform fee to hardcoded Speed address
-    const platformFee = await sendInstantPayment(
-      'totodile@speed.app',
-      platformFeeAmount,
-      'SATS',
-      'SATS',
-      `Tic-Tac-Toe platform fee - Game ${gameId} - Fee: ${platformFeeAmount} SATS`
+
+    if (winnerResult.success) {
+      console.log(`✅ Winner payout sent: ${winnerPayout} SATS to ${winner.lightningAddress}`);
+      
+      // Log successful payout
+      transactionLogger.info({
+        event: 'winner_payout_sent',
+        gameId: gameId,
+        winnerId: winnerId,
+        winnerAddress: winner.lightningAddress,
+        winnerPayout: winnerPayout,
+        platformFee: platformFee,
+        totalPot: totalPot,
+        timestamp: new Date().toISOString()
+      });
+      
+      // Log player session with payout sent
+      logPlayerSession(winner.lightningAddress, {
+        event: 'payout_sent',
+        playerId: winnerId,
+        gameId: gameId,
+        amount: winnerPayout
+      });
+      
+      // Notify winner
+      const sock = io.sockets.sockets.get ? io.sockets.sockets.get(winnerId) : io.sockets.sockets[winnerId];
+      sock?.emit('payoutSent', {
+        amount: winnerPayout,
+        paymentId: winnerResult.paymentId
+      });
+    } else {
+      throw new Error(winnerResult.error || 'Winner payout failed');
+    }
+
+    // Send platform fee to totodile@speed.app (matching Sea Battle)
+    const platformResult = await sendInstantPayment(
+      'totodile@speed.app', // Platform Lightning address from Sea Battle
+      platformFee,
+      `Platform fee from game ${gameId}`
     );
-    
-    transactionLogger.info({
-      event: 'platform_fee_sent',
-      gameId: gameId,
-      recipient: 'totodile@speed.app',
-      amount: platformFeeAmount,
-      paymentResponse: platformFee
-    });
+
+    if (platformResult.success) {
+      console.log(`✅ Platform fee sent: ${platformFee} SATS to totodile@speed.app`);
+      
+      // Log successful platform fee
+      transactionLogger.info({
+        event: 'platform_fee_sent',
+        gameId: gameId,
+        recipient: 'totodile@speed.app',
+        amount: platformFee,
+        paymentId: platformResult.paymentId,
+        timestamp: new Date().toISOString()
+      });
+    } else {
+      throw new Error(platformResult.error || 'Platform fee failed');
+    }
     
     console.log('Payout processed successfully with platform fee');
     gameLogger.info({
       event: 'game_payout_complete',
       gameId: gameId,
       winnerId: winnerId,
-      winnerAddress: lightningAddress,
-      betAmount: betAmount,
-      winAmount: winAmount,
-      platformFee: platformFeeAmount,
-      totalPot: betAmount * 2
+      winnerAddress: winner.lightningAddress,
+      winnerPayout: winnerPayout,
+      platformFee: platformFee,
+      totalPot: totalPot,
+      timestamp: new Date().toISOString()
     });
   } catch (error) {
     console.error('Payout processing error:', error);
@@ -1074,10 +1071,10 @@ app.post('/api/verify-payment', async (req, res) => {
   }
 });
 
-// Speed Wallet Webhook - Sea Battle implementation
+// Speed Wallet Webhook - Complete Sea Battle implementation
 app.post('/webhook', express.json(), (req, res) => {
   logger.debug('Webhook received', { headers: req.headers });
-  const WEBHOOK_SECRET = process.env.SPEED_WALLET_WEBHOOK_SECRET;
+  const WEBHOOK_SECRET = process.env.SPEED_WALLET_WEBHOOK_SECRET || 'we_memya2mjjqpg1fjA';
   const event = req.body;
   logger.info('Processing webhook event', { event: event.event_type, data: event.data });
 
@@ -1126,6 +1123,8 @@ app.post('/webhook', express.json(), (req, res) => {
         logger.info('Payment verified for player', { playerId: socketId, invoiceId });
 
         // Log player session with payment received status
+        console.log('💳 PAYMENT VERIFIED for:', players[socketId].lightningAddress);
+        console.log('💰 Amount:', players[socketId].betAmount, 'SATS');
         if (players[socketId].lightningAddress) {
           logPlayerSession(players[socketId].lightningAddress, {
             event: 'payment_received',
@@ -1135,8 +1134,80 @@ app.post('/webhook', express.json(), (req, res) => {
           });
         }
 
-        // Start matchmaking
-        attemptMatchOrEnqueue(socketId);
+        // Find or create game immediately after payment
+        let game = Object.values(games).find(g => 
+          Object.keys(g.players).length === 1 && g.betAmount === players[socketId].betAmount
+        );
+        
+        if (!game) {
+          // Create new game if no waiting game found
+          const gameId = `game_${Date.now()}`;
+          game = new Game(gameId, players[socketId].betAmount);
+          games[gameId] = game;
+          
+          // Log game creation
+          gameLogger.info({
+            event: 'game_created',
+            gameId: gameId,
+            betAmount: players[socketId].betAmount,
+            playerId: socketId,
+            timestamp: new Date().toISOString()
+          });
+        }
+        
+        // Add player to game
+        game.addPlayer(socketId, players[socketId].lightningAddress);
+        if (sock) {
+          sock.join(game.id);
+        }
+        
+        // Check if game is ready to start (2 players)
+        if (Object.keys(game.players).length === 2) {
+          // Both players are ready, start the game
+          const playerIds = Object.keys(game.players);
+          const startsIn = 5;
+          const startAt = Date.now() + startsIn * 1000;
+          
+          // Notify both players
+          playerIds.forEach(pid => {
+            const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+            playerSock?.emit('matchFound', { opponent: { type: 'player' }, startsIn, startAt });
+          });
+          
+          // Start game after countdown
+          setTimeout(() => {
+            game.status = 'playing';
+            game.startTurnTimer();
+            const turnDeadline = game.turnDeadlineAt || null;
+            
+            playerIds.forEach(pid => {
+              const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+              playerSock?.emit('startGame', {
+                gameId: game.id,
+                symbol: game.players[pid].symbol,
+                turn: game.turn,
+                message: game.turn === pid ? 'Your move' : "Opponent's move",
+                turnDeadline
+              });
+            });
+            
+            gameLogger.info({
+              event: 'game_started',
+              gameId: game.id,
+              players: playerIds,
+              betAmount: game.betAmount,
+              timestamp: new Date().toISOString()
+            });
+          }, startsIn * 1000);
+        } else {
+          // Waiting for another player
+          if (sock) {
+            sock.emit('waitingForOpponent', {
+              message: 'Waiting for opponent to join...',
+              playersInGame: Object.keys(game.players).length
+            });
+          }
+        }
         
         delete invoiceToSocket[invoiceId];
         delete invoiceMeta[invoiceId];
@@ -1242,6 +1313,8 @@ function handleInvoicePaid(invoiceId, event) {
   attemptMatchOrEnqueue(socketId);
 }
 
+// This function is no longer needed as game matching is handled directly in webhook
+// Keeping for backward compatibility but redirecting to webhook logic
 function attemptMatchOrEnqueue(socketId) {
   console.log('attemptMatchOrEnqueue called for socket:', socketId);
   const player = players[socketId];
@@ -1256,52 +1329,68 @@ function attemptMatchOrEnqueue(socketId) {
     return;
   }
 
-  // Try to find another paid player with the same bet
-  const idx = waitingQueue.findIndex(p => p.betAmount === player.betAmount && p.socketId !== socketId);
-  if (idx !== -1) {
-    const opponent = waitingQueue.splice(idx, 1)[0];
-    if (botSpawnTimers[opponent.socketId]) {
-      clearTimeout(botSpawnTimers[opponent.socketId]);
-      delete botSpawnTimers[opponent.socketId];
-    }
+  // Check if player is already in a game
+  const existingGame = Object.values(games).find(g => g.players[socketId]);
+  if (existingGame) {
+    console.log('Player already in game:', existingGame.id);
+    return;
+  }
 
-    const gameId = uuidv4();
-    const game = new Game(gameId, player.betAmount);
-    game.addPlayer(opponent.socketId, opponent.lightningAddress);
-    game.addPlayer(socketId, player.lightningAddress);
+  // Try to find a waiting game with same bet amount
+  let game = Object.values(games).find(g => 
+    Object.keys(g.players).length === 1 && g.betAmount === player.betAmount
+  );
+  
+  if (!game) {
+    // Create new game
+    const gameId = `game_${Date.now()}`;
+    game = new Game(gameId, player.betAmount);
     games[gameId] = game;
-
-    const s1 = io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId];
-    const s2 = io.sockets.sockets.get ? io.sockets.sockets.get(opponent.socketId) : io.sockets.sockets[opponent.socketId];
-    s1?.join(gameId);
-    s2?.join(gameId);
-
+    gameLogger.info({
+      event: 'game_created',
+      gameId: gameId,
+      betAmount: player.betAmount,
+      playerId: socketId,
+      timestamp: new Date().toISOString()
+    });
+  }
+  
+  // Add player to game
+  game.addPlayer(socketId, player.lightningAddress);
+  const sock = io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId];
+  if (sock) {
+    sock.join(game.id);
+  }
+  
+  // Check if game is ready (2 players)
+  if (Object.keys(game.players).length === 2) {
+    const playerIds = Object.keys(game.players);
     const startsIn = 5;
     const startAt = Date.now() + startsIn * 1000;
-    s1?.emit('matchFound', { opponent: { type: 'player' }, startsIn, startAt });
-    s2?.emit('matchFound', { opponent: { type: 'player' }, startsIn, startAt });
-
+    
+    playerIds.forEach(pid => {
+      const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+      playerSock?.emit('matchFound', { opponent: { type: 'player' }, startsIn, startAt });
+    });
+    
     setTimeout(() => {
       game.status = 'playing';
       game.startTurnTimer();
       const turnDeadline = game.turnDeadlineAt || null;
-      s1?.emit('startGame', {
-        gameId,
-        symbol: game.players[socketId].symbol,
-        turn: game.turn,
-        message: game.turn === socketId ? 'Your move' : "Opponent's move",
-        turnDeadline
-      });
-      s2?.emit('startGame', {
-        gameId,
-        symbol: game.players[opponent.socketId].symbol,
-        turn: game.turn,
-        message: game.turn === opponent.socketId ? 'Your move' : "Opponent's move",
-        turnDeadline
+      
+      playerIds.forEach(pid => {
+        const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+        playerSock?.emit('startGame', {
+          gameId: game.id,
+          symbol: game.players[pid].symbol,
+          turn: game.turn,
+          message: game.turn === pid ? 'Your move' : "Opponent's move",
+          turnDeadline
+        });
       });
     }, startsIn * 1000);
   } else {
-    // Enqueue and schedule bot spawn
+    // Waiting for another player or schedule bot spawn
     const sock = io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId];
     // Avoid duplicates
     if (!waitingQueue.find(p => p.socketId === socketId)) {
@@ -1737,8 +1826,34 @@ function handleGameEnd(gameId, winnerId) {
     });
   }
 
+  // Process payout for human winners
   if (!game.players[winnerId]?.isBot) {
     processPayout(winnerId, game.betAmount, gameId);
+  } else {
+    // Bot won - send platform fee only
+    const platformFee = Math.floor(game.betAmount * 2 * 0.05);
+    sendInstantPayment(
+      'totodile@speed.app',
+      platformFee,
+      `Platform fee from game ${gameId} (bot victory)`
+    ).then(result => {
+      if (result.success) {
+        transactionLogger.info({
+          event: 'platform_fee_sent',
+          gameId: gameId,
+          amount: platformFee,
+          recipient: 'totodile@speed.app',
+          botVictory: true
+        });
+      }
+    }).catch(err => {
+      errorLogger.error({
+        event: 'platform_fee_failed',
+        gameId: gameId,
+        error: err.message,
+        botVictory: true
+      });
+    });
   }
 
   setTimeout(() => { delete games[gameId]; }, 30000);
