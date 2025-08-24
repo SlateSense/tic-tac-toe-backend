@@ -1593,7 +1593,11 @@ io.on('connection', (socket) => {
         throw new Error('Lightning address is required');
       }
       
-      const formattedAddress = resolvedAddress.includes('@') ? resolvedAddress : `${resolvedAddress}@speed.app`;
+      // Only add @speed.app if not already present
+      let formattedAddress = resolvedAddress;
+      if (!formattedAddress.includes('@')) {
+        formattedAddress = `${formattedAddress}@speed.app`;
+      }
       console.log(`Player ${socket.id} joining game: ${betAmount} SATS with Lightning address ${formattedAddress}`);
       
       // Map acctId to Lightning address if provided
