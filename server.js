@@ -14,6 +14,7 @@ const { bech32 } = require('bech32');
 const Queue = require('express-queue');
 const winston = require('winston');
 require('winston-daily-rotate-file');
+const { BotPlayer, getRandomBotSpawnDelay, generateBotLightningAddress } = require('./botLogic');
 
 // Configure Winston logging with Sea Battle style loggers
 const transactionLogger = winston.createLogger({
@@ -189,10 +190,8 @@ const userSessions = {}; // Maps acct_id to Lightning address
 const playerAcctIds = {}; // Maps playerId to acct_id
 const processedWebhooks = new Set();
 
-// Player history tracking for win/loss patterns
-const playerGameHistory = {}; // lightningAddress -> { games: [], currentPatternIndex: 0 }
-const PATTERN_50_SATS = ['W', 'L', 'W', 'W', 'L', 'L', 'L', 'W', 'L']; // Pattern for 50 sats
-const PATTERN_300_PLUS = ['L', 'W', 'L', 'W', 'L', 'L', 'W', 'L', 'W']; // Pattern for 300+ sats
+// Bot management
+const activeBots = new Map(); // gameId -> BotPlayer instance
 
 // Function to store or retrieve acct_id for Lightning address
 function mapUserAcctId(acctId, lightningAddress) {
@@ -835,10 +834,6 @@ const games = {};
 const waitingQueue = []; // Players waiting for match
 const botSpawnTimers = {}; // Track bot spawn timers
 
-// Bot thinking times
-const BOT_THINK_TIME = { min: 1500, max: 4500 }; // Human-like delays
-const BOT_SPAWN_DELAY = { min: 13000, max: 25000 };
-
 // Speed wallet routes
 app.get('/api/speed-wallet/lightning-address', async (req, res) => {
   const { authToken } = req.query;
@@ -1269,12 +1264,93 @@ app.post('/webhook', (req, res) => {
             });
           }, startsIn * 1000);
         } else {
-          // Waiting for another player
+          // Waiting for another player - schedule bot spawn
           if (sock) {
+            const delay = getRandomBotSpawnDelay();
+            const estWaitSeconds = Math.floor(delay / 1000);
+            
             sock.emit('waitingForOpponent', {
-              message: 'Waiting for opponent to join...',
+              message: 'Finding opponent...',
+              estimatedWait: `${13}-${25} seconds`,
               playersInGame: Object.keys(game.players).length
             });
+            
+            // Schedule bot to join if no real player joins
+            botSpawnTimers[socketId] = setTimeout(() => {
+              // Check if still waiting
+              const currentGame = Object.values(games).find(g => 
+                g.players[socketId] && Object.keys(g.players).length === 1
+              );
+              
+              if (currentGame) {
+                // Add bot to game
+                const botId = `bot_${uuidv4()}`;
+                const botAddress = generateBotLightningAddress();
+                const bot = new BotPlayer(currentGame.id, currentGame.betAmount, players[socketId].lightningAddress);
+                activeBots.set(currentGame.id, bot);
+                
+                currentGame.addPlayer(botId, botAddress, true);
+                players[botId] = {
+                  lightningAddress: botAddress,
+                  betAmount: currentGame.betAmount,
+                  paid: true,
+                  isBot: true,
+                  gameId: currentGame.id
+                };
+                
+                // Notify players that match is found
+                const playerIds = Object.keys(currentGame.players);
+                const startsIn = 5;
+                const startAt = Date.now() + startsIn * 1000;
+                
+                playerIds.forEach(pid => {
+                  if (!currentGame.players[pid].isBot) {
+                    const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+                    playerSock?.emit('matchFound', { 
+                      opponent: { type: 'player' }, // Don't reveal it's a bot
+                      startsIn, 
+                      startAt 
+                    });
+                  }
+                });
+                
+                // Start game after countdown
+                setTimeout(() => {
+                  currentGame.status = 'playing';
+                  currentGame.startTurnTimer();
+                  const turnDeadline = currentGame.turnDeadlineAt || null;
+                  
+                  playerIds.forEach(pid => {
+                    if (!currentGame.players[pid].isBot) {
+                      const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+                      playerSock?.emit('startGame', {
+                        gameId: currentGame.id,
+                        symbol: currentGame.players[pid].symbol,
+                        turn: currentGame.turn,
+                        message: currentGame.turn === pid ? 'Your move' : "Opponent's move",
+                        turnDeadline
+                      });
+                    }
+                  });
+                  
+                  // If bot starts, make first move
+                  if (currentGame.players[currentGame.turn]?.isBot) {
+                    makeBotMove(currentGame.id, currentGame.turn);
+                  }
+                  
+                  gameLogger.info({
+                    event: 'game_started_with_bot',
+                    gameId: currentGame.id,
+                    humanPlayer: socketId,
+                    botPlayer: botId,
+                    betAmount: currentGame.betAmount,
+                    timestamp: new Date().toISOString()
+                  });
+                }, startsIn * 1000);
+                
+                delete botSpawnTimers[socketId];
+              }
+            }, delay);
           }
         }
         
@@ -1529,283 +1605,95 @@ function attemptMatchOrEnqueue(socketId) {
   }
 }
 
-// Get or create player history
-function getPlayerHistory(lightningAddress) {
-  if (!playerGameHistory[lightningAddress]) {
-    playerGameHistory[lightningAddress] = {
-      games: [],
-      currentPatternIndex: 0,
-      lastBetAmount: 0,
-      consecutiveSameBet: 0
-    };
-  }
-  return playerGameHistory[lightningAddress];
-}
-
-// Determine if bot should win based on pattern
-function shouldBotWin(lightningAddress, betAmount) {
-  const history = getPlayerHistory(lightningAddress);
+// Make bot move with human-like delay
+function makeBotMove(gameId, botId) {
+  const game = games[gameId];
+  if (!game || game.status !== 'playing') return;
   
-  // For 50 sats - use fixed pattern
-  if (betAmount === 50) {
-    const pattern = PATTERN_50_SATS;
-    const shouldWin = pattern[history.currentPatternIndex % pattern.length] === 'L'; // L means player loses (bot wins)
-    return shouldWin;
-  }
+  const bot = activeBots.get(gameId);
+  if (!bot) return;
   
-  // For 300+ sats - use complex pattern with bet tracking
-  if (betAmount >= 300) {
-    // Check if same bet amount as last game
-    if (history.lastBetAmount === betAmount) {
-      history.consecutiveSameBet++;
-    } else {
-      history.consecutiveSameBet = 1;
-      history.currentPatternIndex = 0; // Reset pattern for new bet amount
+  // Get move from bot logic
+  const move = bot.getMove(game.board);
+  if (move === null || move === undefined) return;
+  
+  // Apply human-like delay
+  const delay = bot.getThinkingTime();
+  
+  setTimeout(() => {
+    // Double-check game still exists and it's bot's turn
+    if (!games[gameId] || games[gameId].status !== 'playing' || games[gameId].turn !== botId) {
+      return;
     }
     
-    const pattern = PATTERN_300_PLUS;
-    const shouldWin = pattern[history.currentPatternIndex % pattern.length] === 'L'; // L means player loses (bot wins)
+    // Make the move
+    const result = game.makeMove(move, botId);
     
-    // Special rule: player wins on second attempt with same bet amount
-    if (history.consecutiveSameBet === 2 && history.games.length > 0) {
-      const lastGame = history.games[history.games.length - 1];
-      if (lastGame.betAmount === betAmount && !lastGame.playerWon) {
-        return false; // Bot should lose (player wins)
-      }
-    }
-    
-    return shouldWin;
-  }
-  
-  // Default fair play for other amounts
-  return Math.random() < 0.5;
-}
-
-// Update player history after game
-function updatePlayerHistory(lightningAddress, betAmount, playerWon) {
-  const history = getPlayerHistory(lightningAddress);
-  history.games.push({
-    betAmount,
-    playerWon,
-    timestamp: Date.now()
-  });
-  history.lastBetAmount = betAmount;
-  history.currentPatternIndex++;
-  
-  // Keep only last 100 games to prevent memory bloat
-  if (history.games.length > 100) {
-    history.games = history.games.slice(-100);
-  }
-}
-
-// Bot logic functions with difficulty levels
-function minimax(board, depth, isMaximizing, playerSymbol, opponentSymbol, maxDepth = 9) {
-  const winner = checkBoardWinner(board);
-  
-  if (winner === playerSymbol) return 10 - depth;
-  if (winner === opponentSymbol) return depth - 10;
-  if (board.every(cell => cell !== null)) return 0;
-  if (depth >= maxDepth) return 0; // Limit search depth for weaker play
-  
-  if (isMaximizing) {
-    let maxEval = -Infinity;
-    for (let i = 0; i < 9; i++) {
-      if (board[i] === null) {
-        board[i] = playerSymbol;
-        const eval = minimax(board, depth + 1, false, playerSymbol, opponentSymbol, maxDepth);
-        board[i] = null;
-        maxEval = Math.max(maxEval, eval);
-      }
-    }
-    return maxEval;
-  } else {
-    let minEval = Infinity;
-    for (let i = 0; i < 9; i++) {
-      if (board[i] === null) {
-        board[i] = opponentSymbol;
-        const eval = minimax(board, depth + 1, true, playerSymbol, opponentSymbol, maxDepth);
-        board[i] = null;
-        minEval = Math.min(minEval, eval);
-      }
-    }
-    return minEval;
-  }
-}
-
-// Bot logic functions (with controlled difficulty)
-function minimaxOriginal(board, depth, isMaximizing, playerSymbol, opponentSymbol) {
-  const winner = checkBoardWinner(board);
-  
-  if (winner === playerSymbol) return 10 - depth;
-  if (winner === opponentSymbol) return depth - 10;
-  if (board.every(cell => cell !== null)) return 0;
-  
-  if (isMaximizing) {
-    let maxEval = -Infinity;
-    for (let i = 0; i < 9; i++) {
-      if (board[i] === null) {
-        board[i] = playerSymbol;
-        const eval = minimax(board, depth + 1, false, playerSymbol, opponentSymbol);
-        board[i] = null;
-        maxEval = Math.max(maxEval, eval);
-      }
-    }
-    return maxEval;
-  } else {
-    let minEval = Infinity;
-    for (let i = 0; i < 9; i++) {
-      if (board[i] === null) {
-        board[i] = opponentSymbol;
-        const eval = minimax(board, depth + 1, true, playerSymbol, opponentSymbol);
-        board[i] = null;
-        minEval = Math.min(minEval, eval);
-      }
-    }
-    return minEval;
-  }
-}
-
-function checkBoardWinner(board) {
-  const lines = [
-    [0, 1, 2], [3, 4, 5], [6, 7, 8],
-    [0, 3, 6], [1, 4, 7], [2, 5, 8],
-    [0, 4, 8], [2, 4, 6]
-  ];
-  
-  for (const [a, b, c] of lines) {
-    if (board[a] && board[a] === board[b] && board[a] === board[c]) {
-      return board[a];
-    }
-  }
-  return null;
-}
-
-function getBotMove(game, botId) {
-  const bot = game.players[botId];
-  if (!bot || !bot.isBot) return null;
-  
-  const board = [...game.board];
-  const botSymbol = bot.symbol;
-  const humanSymbol = botSymbol === 'X' ? 'O' : 'X';
-  const availableMoves = board.map((cell, i) => cell === null ? i : -1).filter(i => i !== -1);
-  
-  if (availableMoves.length === 0) return null;
-  
-  // Get human player info
-  const humanId = Object.keys(game.players).find(id => !game.players[id].isBot);
-  const humanPlayer = game.players[humanId];
-  const shouldWin = shouldBotWin(humanPlayer.lightningAddress, game.betAmount);
-  
-  // Count draws (filled cells without winner)
-  const filledCells = board.filter(cell => cell !== null).length;
-  const hasWinner = checkBoardWinner(board) !== null;
-  const drawCount = Math.floor(filledCells / 2); // Approximate draw count
-  
-  // Determine bot behavior based on pattern
-  if (shouldWin) {
-    // Bot should win - play competitively
-    
-    // 1) Take immediate win
-    for (const move of availableMoves) {
-      board[move] = botSymbol;
-      if (checkBoardWinner(board) === botSymbol) { 
-        board[move] = null; 
-        return move; 
-      }
-      board[move] = null;
-    }
-    
-    // 2) Block immediate loss
-    for (const move of availableMoves) {
-      board[move] = humanSymbol;
-      if (checkBoardWinner(board) === humanSymbol) { 
-        board[move] = null; 
-        return move; 
-      }
-      board[move] = null;
-    }
-    
-    // 3) After 3-4 draws, make a strong move to win
-    if (drawCount >= 3) {
-      // Use full minimax for best play
-      let bestMove = availableMoves[0];
-      let bestScore = -Infinity;
-      for (const move of availableMoves) {
-        board[move] = botSymbol;
-        const score = minimax(board, 0, false, botSymbol, humanSymbol, 9);
-        board[move] = null;
-        if (score > bestScore) { 
-          bestScore = score; 
-          bestMove = move; 
+    if (result.success) {
+      // Emit move to all players
+      Object.keys(game.players).forEach(pid => {
+        if (!game.players[pid].isBot) {
+          const sock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+          sock?.emit('moveMade', {
+            position: move,
+            symbol: game.players[botId].symbol,
+            nextTurn: result.nextTurn,
+            board: game.board,
+            turnDeadline: game.turnDeadlineAt
+          });
         }
-      }
-      return bestMove;
-    }
-    
-    // Normal competitive play
-    const preferences = [4, 0, 2, 6, 8, 1, 3, 5, 7];
-    for (const pref of preferences) {
-      if (availableMoves.includes(pref)) return pref;
-    }
-  } else {
-    // Bot should lose - play like a noob
-    
-    // Still block immediate wins to make it realistic
-    for (const move of availableMoves) {
-      board[move] = humanSymbol;
-      if (checkBoardWinner(board) === humanSymbol) { 
-        // Sometimes "miss" the block (20% chance)
-        if (Math.random() < 0.8) {
-          board[move] = null;
-          return move;
-        }
-      }
-      board[move] = null;
-    }
-    
-    // After 2-5 draws, make a "silly mistake"
-    if (drawCount >= 2 && drawCount <= 5 && Math.random() < 0.7) {
-      // Make a random bad move
-      const badMoves = availableMoves.filter(move => {
-        // Check if this move doesn't block or win
-        board[move] = botSymbol;
-        const botWins = checkBoardWinner(board) === botSymbol;
-        board[move] = humanSymbol;
-        const humanWins = checkBoardWinner(board) === humanSymbol;
-        board[move] = null;
-        return !botWins && !humanWins;
       });
       
-      if (badMoves.length > 0) {
-        return badMoves[Math.floor(Math.random() * badMoves.length)];
+      // Check for game end
+      if (result.winner || result.draw) {
+        handleGameEnd(gameId, result.winner);
+      } else if (game.players[game.turn]?.isBot) {
+        // If it's still bot's turn (shouldn't happen in tic-tac-toe), make another move
+        makeBotMove(gameId, game.turn);
       }
     }
-    
-    // Make suboptimal moves
-    if (Math.random() < 0.6) {
-      // Random move 60% of the time
-      return availableMoves[Math.floor(Math.random() * availableMoves.length)];
+  }, delay);
+}
+
+// Handle game end with bot cleanup
+function handleGameEnd(gameId, winnerId) {
+  const game = games[gameId];
+  if (!game) return;
+  
+  game.status = 'finished';
+  game.clearTurnTimer();
+  
+  // Clean up bot
+  const bot = activeBots.get(gameId);
+  if (bot) {
+    // Update player history if human player
+    const humanId = Object.keys(game.players).find(id => !game.players[id].isBot);
+    if (humanId) {
+      const humanPlayer = game.players[humanId];
+      const playerWon = winnerId === humanId;
+      bot.recordGameResult(playerWon);
     }
-    
-    // Weak minimax with limited depth
-    let bestMove = availableMoves[0];
-    let bestScore = -Infinity;
-    for (const move of availableMoves) {
-      board[move] = botSymbol;
-      const score = minimax(board, 0, false, botSymbol, humanSymbol, 2); // Limited depth
-      board[move] = null;
-      // Add randomness to score
-      const randomizedScore = score + (Math.random() - 0.5) * 4;
-      if (randomizedScore > bestScore) { 
-        bestScore = randomizedScore; 
-        bestMove = move; 
-      }
-    }
-    return bestMove;
+    activeBots.delete(gameId);
   }
   
-  // Fallback - random move
-  return availableMoves[Math.floor(Math.random() * availableMoves.length)];
+  // Handle payouts for real games (not bot games)
+  const botInGame = Object.values(game.players).some(p => p.isBot);
+  if (!botInGame && winnerId && game.betAmount > 0) {
+    const winner = game.players[winnerId];
+    if (winner && winner.lightningAddress) {
+      processPayout(winner.lightningAddress, game.betAmount, gameId);
+    }
+  }
+  
+  // Clean up players
+  Object.keys(game.players).forEach(pid => {
+    delete players[pid];
+  });
+  
+  // Remove game after a delay
+  setTimeout(() => {
+    delete games[gameId];
+  }, 5000);
 }
 
 // Socket.io connection handling
@@ -1968,27 +1856,32 @@ io.on('connection', (socket) => {
     const game = games[gameId];
     if (!game || game.turn !== socket.id) return socket.emit('error', { message: 'Invalid move' });
 
-    const result = game.makeMove(socket.id, position);
-    if (!result.ok) return socket.emit('error', { message: result.reason });
+    const result = game.makeMove(position, socket.id);
+    if (!result.success) return socket.emit('error', { message: result.message || 'Invalid move' });
 
-    io.to(gameId).emit('boardUpdate', { board: game.board, lastMove: position });
+    // Emit move to all players
+    Object.keys(game.players).forEach(pid => {
+      if (!game.players[pid].isBot) {
+        const sock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+        sock?.emit('moveMade', {
+          position: position,
+          symbol: game.players[socket.id].symbol,
+          nextTurn: result.nextTurn,
+          board: game.board,
+          turnDeadline: game.turnDeadlineAt
+        });
+      }
+    });
 
     if (result.winner) {
       handleGameEnd(gameId, result.winner);
     } else if (result.draw) {
       handleDraw(gameId);
     } else {
+      // Check if it's bot's turn
       const botId = Object.keys(game.players).find(id => game.players[id].isBot);
       if (botId && game.turn === botId) {
-        setTimeout(() => {
-          const move = getBotMove(game, botId);
-          if (move !== null) {
-            const botResult = game.makeMove(botId, move);
-            io.to(gameId).emit('boardUpdate', { board: game.board, lastMove: move });
-            if (botResult.winner) handleGameEnd(gameId, botResult.winner);
-            else if (botResult.draw) handleDraw(gameId);
-          }
-        }, BOT_THINK_TIME.min + Math.random() * (BOT_THINK_TIME.max - BOT_THINK_TIME.min));
+        makeBotMove(gameId, botId);
       }
     }
   });
