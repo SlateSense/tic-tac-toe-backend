@@ -1158,253 +1158,58 @@ app.post('/api/verify-payment', async (req, res) => {
   }
 });
 
-// Speed Wallet Webhook - Complete Sea Battle implementation
-app.post('/webhook', (req, res) => {
-  logger.debug('Webhook received', { headers: req.headers });
-  // Verify webhook signature per Speed docs
-  try {
-    const webhookId = req.headers['webhook-id'];
-    const webhookTimestamp = req.headers['webhook-timestamp'];
-    const signatureHeader = req.headers['webhook-signature'];
-    if (!webhookId || !webhookTimestamp || !signatureHeader || !req.rawBody) {
-      logger.warn('Missing signature headers or raw body', {
-        hasId: !!webhookId, hasTs: !!webhookTimestamp, hasSig: !!signatureHeader, hasRaw: !!req.rawBody
-      });
-      return res.status(400).send('Missing signature headers');
-    }
-
-    const secretRaw = process.env.SPEED_WALLET_WEBHOOK_SECRET;
-    if (!secretRaw) {
-      logger.error('SPEED_WALLET_WEBHOOK_SECRET not configured');
-      return res.status(500).send('Server not configured');
-    }
-    const base64Part = secretRaw.startsWith('wsec_') ? secretRaw.slice(5) : secretRaw;
-    let secretBytes;
-    try {
-      secretBytes = Buffer.from(base64Part, 'base64');
-    } catch (e) {
-      logger.error('Invalid webhook secret format');
-      return res.status(500).send('Server not configured');
-    }
-
-    const signedPayload = `${webhookId}.${webhookTimestamp}.${req.rawBody}`;
-    const expectedSig = crypto
-      .createHmac('sha256', secretBytes)
-      .update(signedPayload, 'utf8')
-      .digest('base64');
-
-    // Signature header may contain multiple values and a version prefix (e.g., "v1,BASE64")
-    const candidates = String(signatureHeader)
-      .trim()
-      .split(/\s+/)
-      .map(s => {
-        if (s.includes(',')) return s.split(',')[1] || '';
-        if (s.includes('=')) return s.split('=')[1] || '';
-        return s;
-      })
-      .filter(Boolean);
-
-    const match = candidates.some(sig => {
-      const a = Buffer.from(expectedSig);
-      const b = Buffer.from(sig);
-      return a.length === b.length && crypto.timingSafeEqual(a, b);
-    });
-
-    if (!match) {
-      logger.warn('Invalid webhook signature', { webhookId, webhookTimestamp });
-      return res.status(400).send('Invalid signature');
-    }
-
-    // Idempotency: ignore duplicate webhook-id
-    if (processedWebhooks.has(webhookId)) {
-      logger.info('Duplicate webhook ignored', { webhookId });
-      return res.status(200).send('Duplicate');
-    }
-    processedWebhooks.add(webhookId);
-  } catch (e) {
-    logger.error('Webhook verification error', { error: e.message });
-    return res.status(400).send('Invalid signature');
+// Test endpoint to simulate payment verification (for testing only)
+app.post('/test-payment/:socketId', (req, res) => {
+  const { socketId } = req.params;
+  const { betAmount = 50, lightningAddress = 'test@speed.app' } = req.body;
+  
+  console.log('TEST: Simulating payment for socket:', socketId);
+  
+  // Simulate payment verification
+  players[socketId] = players[socketId] || {};
+  players[socketId].paid = true;
+  players[socketId].betAmount = betAmount;
+  players[socketId].lightningAddress = lightningAddress;
+  
+  const sock = io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId];
+  if (sock) {
+    sock.emit('paymentVerified');
+    console.log('TEST: Emitted paymentVerified to socket:', socketId);
   }
+  
+  // Trigger matching
+  attemptMatchOrEnqueue(socketId);
+  
+  res.json({ success: true, message: 'Payment simulated' });
+});
 
-  const event = req.body;
-  logger.info('Processing webhook event', { event: event.event_type, data: event.data });
-
+// Speed Wallet Webhook - Complete Sea Battle implementation
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
-    const eventType = event.event_type;
-    logger.debug('Processing event type', { eventType });
-
-    switch (eventType) {
-      case 'invoice.paid':
-      case 'payment.paid':
-      case 'payment.confirmed':
-        const invoiceId = event.data?.object?.id || event.data?.id;
-        if (!invoiceId) {
-          logger.error('Webhook error: No invoiceId in webhook payload');
-          return res.status(400).send('No invoiceId in webhook payload');
-        }
-
-        const socketId = invoiceToSocket[invoiceId];
-        if (!socketId) {
-          logger.warn(`Webhook warning: No socketId found for invoice ${invoiceId}. Player may have disconnected before mapping was stored.`);
-          return res.status(200).send('Webhook received but no socketId found');
-        }
-        const sock = (io.sockets && io.sockets.sockets && (io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId])) || null;
-
-        // Log payment verification
-        const paymentData = {
-          event: 'payment_verified',
-          playerId: socketId,
-          invoiceId: invoiceId,
-          amount: players[socketId]?.betAmount || 'unknown',
-          lightningAddress: players[socketId]?.lightningAddress || 'unknown',
-          timestamp: new Date().toISOString(),
-          eventType: eventType
-        };
-        
-        transactionLogger.info(paymentData);
-
-        if (sock) {
-          sock.emit('paymentVerified');
-        }
-        if (!players[socketId]) {
-          logger.warn(`Players record missing for ${socketId} on webhook for invoice ${invoiceId}`);
-          return res.status(200).send('Webhook processed but player not found');
-        }
-        players[socketId].paid = true;
-        logger.info('Payment verified for player', { playerId: socketId, invoiceId });
-
-        // Log player session with payment received status
-        console.log('💳 PAYMENT VERIFIED for:', players[socketId].lightningAddress);
-        console.log('💰 Amount:', players[socketId].betAmount, 'SATS');
-        if (players[socketId].lightningAddress) {
-          logPlayerSession(players[socketId].lightningAddress, {
-            event: 'payment_received',
-            playerId: socketId,
-            betAmount: players[socketId].betAmount,
-            invoiceId: invoiceId
-          });
-        }
-
-        // Find or create game immediately after payment
-        let game = Object.values(games).find(g => 
-          Object.keys(g.players).length === 1 && g.betAmount === players[socketId].betAmount
-        );
-        
-        if (!game) {
-          // Create new game if no waiting game found
-          const gameId = `game_${Date.now()}`;
-          game = new Game(gameId, players[socketId].betAmount);
-          games[gameId] = game;
-          
-          // Log game creation
-          gameLogger.info({
-            event: 'game_created',
-            gameId: gameId,
-            betAmount: players[socketId].betAmount,
-            playerId: socketId,
-            timestamp: new Date().toISOString()
-          });
-        }
-        
-        // Add player to game
-        game.addPlayer(socketId, players[socketId].lightningAddress);
-        if (sock) {
-          sock.join(game.id);
-        }
-        
-        // Check if game is ready to start (2 players)
-        if (Object.keys(game.players).length === 2) {
-          // Both players are ready, start the game
-          const playerIds = Object.keys(game.players);
-          const startsIn = 5;
-          const startAt = Date.now() + startsIn * 1000;
-          
-          // Notify both players
-          playerIds.forEach(pid => {
-            const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
-            playerSock?.emit('matchFound', { opponent: { type: 'player' }, startsIn, startAt });
-          });
-          
-          // Start game after countdown
-          setTimeout(() => {
-            game.status = 'playing';
-            game.startTurnTimer();
-            const turnDeadline = game.turnDeadlineAt || null;
-            
-            playerIds.forEach(pid => {
-              const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
-              playerSock?.emit('startGame', {
-                gameId: game.id,
-                symbol: game.players[pid].symbol,
-                turn: game.turn,
-                message: game.turn === pid ? 'Your move' : "Opponent's move",
-                turnDeadline
-              });
-            });
-            
-            gameLogger.info({
-              event: 'game_started',
-              gameId: game.id,
-              players: playerIds,
-              betAmount: game.betAmount,
-              timestamp: new Date().toISOString()
-            });
-          }, startsIn * 1000);
-        } else {
-          // Waiting for another player
-          if (sock) {
-            sock.emit('waitingForOpponent', {
-              message: 'Waiting for opponent to join...',
-              playersInGame: Object.keys(game.players).length
-            });
-          }
-        }
-        
-        delete invoiceToSocket[invoiceId];
-        delete invoiceMeta[invoiceId];
-        break;
-
-      case 'payment.failed':
-        const failedInvoiceId = event.data?.object?.id || event.data?.id;
-        if (!failedInvoiceId) {
-          logger.error('Webhook error: No invoiceId in webhook payload for payment.failed');
-          return res.status(400).send('No invoiceId in webhook payload');
-        }
-
-        const failedSocketId = invoiceToSocket[failedInvoiceId];
-        const failedSock = (io.sockets && io.sockets.sockets && (io.sockets.sockets.get ? io.sockets.sockets.get(failedSocketId) : io.sockets.sockets[failedSocketId])) || null;
-        if (failedSocketId) {
-          // Log payment failure
-          transactionLogger.info({
-            event: 'payment_failed',
-            playerId: failedSocketId,
-            invoiceId: failedInvoiceId,
-            amount: players[failedSocketId]?.betAmount || 'unknown',
-            lightningAddress: players[failedSocketId]?.lightningAddress || 'unknown',
-            timestamp: new Date().toISOString(),
-            eventType: eventType
-          });
-          
-          if (failedSock) {
-            failedSock.emit('error', { message: 'Payment failed. Please try again.' });
-          }
-          logger.warn('Payment failed for player', { playerId: failedSocketId, invoiceId: failedInvoiceId });
-          delete players[failedSocketId];
-          delete invoiceToSocket[failedInvoiceId];
-          delete invoiceMeta[failedInvoiceId];
-        } else {
-          logger.warn(`Webhook warning: No socket mapping found for failed invoice ${failedInvoiceId}. Player may have disconnected.`);
-        }
-        break;
-
-      default:
-        console.log(`Unhandled event type: ${eventType}`);
-    }
-
-    res.status(200).send('Webhook received');
-  } catch (error) {
-    console.error('Webhook error:', error.message);
-    res.status(500).send('Webhook processing failed');
+    const { amountSats, description } = req.body;
+    
+    const response = await httpClient.post(`${SPEED_API_BASE}/lnurl/generate`, {
+      amount: amountSats,
+      description: description || `Tic-Tac-Toe Game - ${amountSats} SATS`,
+      currency: 'SATS'
+    }, {
+      headers: {
+        'Authorization': `Basic ${AUTH_HEADER}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    });
+    
+    const lnurl = response.data.lnurl;
+    const qr = response.data.qr;
+    
+    res.json({
+      lnurl,
+      qr
+    });
+  } catch (e) {
+    console.error('Webhook error:', e.message);
+    res.status(500).json({ error: 'Failed to generate LNURL' });
   }
 });
 
@@ -1469,6 +1274,7 @@ function attemptMatchOrEnqueue(socketId) {
   console.log('attemptMatchOrEnqueue called for socket:', socketId);
   const player = players[socketId];
   console.log('Player data:', player);
+  console.log('All players:', players);
   
   if (!player || !player.betAmount || !player.paid) {
     console.log('Player not ready for matching:', {
@@ -1552,6 +1358,12 @@ function attemptMatchOrEnqueue(socketId) {
     const spawnAt = Date.now() + delay;
     const estWaitSeconds = Math.floor(delay / 1000);
     
+    console.log('Emitting waitingForOpponent with:', {
+      minWait: Math.floor(BOT_SPAWN_DELAY.min / 1000),
+      maxWait: Math.floor(BOT_SPAWN_DELAY.max / 1000),
+      estWaitSeconds,
+      spawnAt
+    });
     sock?.emit('waitingForOpponent', {
       minWait: Math.floor(BOT_SPAWN_DELAY.min / 1000),
       maxWait: Math.floor(BOT_SPAWN_DELAY.max / 1000),
@@ -1854,6 +1666,24 @@ io.on('connection', (socket) => {
   // Also keep old event name for compatibility
   socket.on('join_game', async (data) => {
     socket.emit('joinGame', data);
+  });
+  
+  // TEST: Add test payment command
+  socket.on('test_payment', async (data) => {
+    const { betAmount = 50 } = data || {};
+    console.log('TEST: Received test_payment request from', socket.id, 'for', betAmount, 'sats');
+    
+    // Simulate payment flow
+    players[socket.id] = players[socket.id] || {};
+    players[socket.id].paid = true;
+    players[socket.id].betAmount = betAmount;
+    players[socket.id].lightningAddress = data.lightningAddress || 'test@speed.app';
+    
+    socket.emit('paymentVerified');
+    console.log('TEST: Payment verified for', socket.id);
+    
+    // Start matching
+    attemptMatchOrEnqueue(socket.id);
   });
   
   // Handle moves
