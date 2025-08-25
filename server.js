@@ -14,7 +14,6 @@ const { bech32 } = require('bech32');
 const Queue = require('express-queue');
 const winston = require('winston');
 require('winston-daily-rotate-file');
-const { BotAI, getGameHistory, getHumanLikeDelay, botLogger } = require('./botLogic');
 
 // Configure Winston logging with Sea Battle style loggers
 const transactionLogger = winston.createLogger({
@@ -713,18 +712,6 @@ class Game {
       const playerIds = Object.keys(this.players);
       this.turn = playerIds[Math.random() < 0.5 ? 0 : 1];
       this.startingPlayer = this.turn;
-      
-      // Initialize bot AI if there's a bot
-      if (isBot) {
-        this.botAI = new BotAI(this);
-        // Determine if bot should win based on pattern
-        const humanPlayer = Object.values(this.players).find(p => !p.isBot);
-        if (humanPlayer) {
-          const history = getGameHistory(humanPlayer.lightningAddress);
-          const shouldPlayerWin = history.shouldPlayerWin(this.betAmount);
-          this.botAI.setShouldWin(!shouldPlayerWin);
-        }
-      }
     }
     
     return symbol;
@@ -847,79 +834,10 @@ class Game {
 const games = {};
 const waitingQueue = []; // Players waiting for match
 const botSpawnTimers = {}; // Track bot spawn timers
-const activeBots = new Set(); // Track active bot IDs
 
 // Bot thinking times
 const BOT_THINK_TIME = { min: 1500, max: 4500 }; // Human-like delays
 const BOT_SPAWN_DELAY = { min: 13000, max: 25000 };
-
-// Create a bot player
-function createBot(gameId) {
-  const botId = `bot_${uuidv4()}`;
-  const botAddress = `bot_${Math.random().toString(36).substr(2, 9)}@speed.app`;
-  
-  activeBots.add(botId);
-  players[botId] = {
-    id: botId,
-    lightningAddress: botAddress,
-    isBot: true
-  };
-  
-  const game = games[gameId];
-  if (game) {
-    const symbol = game.addPlayer(botId, botAddress, true);
-    
-    botLogger.info({
-      event: 'bot_created',
-      botId,
-      gameId,
-      symbol,
-      betAmount: game.betAmount
-    });
-    
-    return botId;
-  }
-  return null;
-}
-
-// Bot makes a move
-async function botMakeMove(gameId, botId) {
-  const game = games[gameId];
-  if (!game || game.status !== 'playing' || game.turn !== botId) return;
-  
-  const moveCount = game.board.filter(cell => cell !== null).length;
-  const isFirstMove = moveCount === 0 || (moveCount === 1 && game.players[botId].symbol === 'O');
-  
-  // Human-like delay
-  const delay = getHumanLikeDelay(moveCount, isFirstMove);
-  
-  setTimeout(() => {
-    if (!games[gameId] || games[gameId].status !== 'playing') return;
-    
-    const move = game.botAI.getNextMove();
-    if (move !== -1) {
-      const result = game.makeMove(botId, move);
-      
-      // Broadcast move to all players
-      io.to(gameId).emit('moveMade', {
-        position: move,
-        symbol: game.players[botId].symbol,
-        playerId: botId
-      });
-      
-      if (result.winner) {
-        handleGameEnd(gameId, result.winner);
-      } else if (result.draw) {
-        handleDraw(gameId);
-      } else {
-        // Continue game - if it's bot's turn again, make another move
-        if (game.turn === botId) {
-          botMakeMove(gameId, botId);
-        }
-      }
-    }
-  }, delay);
-}
 
 // Speed wallet routes
 app.get('/api/speed-wallet/lightning-address', async (req, res) => {
@@ -1158,58 +1076,253 @@ app.post('/api/verify-payment', async (req, res) => {
   }
 });
 
-// Test endpoint to simulate payment verification (for testing only)
-app.post('/test-payment/:socketId', (req, res) => {
-  const { socketId } = req.params;
-  const { betAmount = 50, lightningAddress = 'test@speed.app' } = req.body;
-  
-  console.log('TEST: Simulating payment for socket:', socketId);
-  
-  // Simulate payment verification
-  players[socketId] = players[socketId] || {};
-  players[socketId].paid = true;
-  players[socketId].betAmount = betAmount;
-  players[socketId].lightningAddress = lightningAddress;
-  
-  const sock = io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId];
-  if (sock) {
-    sock.emit('paymentVerified');
-    console.log('TEST: Emitted paymentVerified to socket:', socketId);
-  }
-  
-  // Trigger matching
-  attemptMatchOrEnqueue(socketId);
-  
-  res.json({ success: true, message: 'Payment simulated' });
-});
-
 // Speed Wallet Webhook - Complete Sea Battle implementation
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+app.post('/webhook', (req, res) => {
+  logger.debug('Webhook received', { headers: req.headers });
+  // Verify webhook signature per Speed docs
   try {
-    const { amountSats, description } = req.body;
-    
-    const response = await httpClient.post(`${SPEED_API_BASE}/lnurl/generate`, {
-      amount: amountSats,
-      description: description || `Tic-Tac-Toe Game - ${amountSats} SATS`,
-      currency: 'SATS'
-    }, {
-      headers: {
-        'Authorization': `Basic ${AUTH_HEADER}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 10000
+    const webhookId = req.headers['webhook-id'];
+    const webhookTimestamp = req.headers['webhook-timestamp'];
+    const signatureHeader = req.headers['webhook-signature'];
+    if (!webhookId || !webhookTimestamp || !signatureHeader || !req.rawBody) {
+      logger.warn('Missing signature headers or raw body', {
+        hasId: !!webhookId, hasTs: !!webhookTimestamp, hasSig: !!signatureHeader, hasRaw: !!req.rawBody
+      });
+      return res.status(400).send('Missing signature headers');
+    }
+
+    const secretRaw = process.env.SPEED_WALLET_WEBHOOK_SECRET;
+    if (!secretRaw) {
+      logger.error('SPEED_WALLET_WEBHOOK_SECRET not configured');
+      return res.status(500).send('Server not configured');
+    }
+    const base64Part = secretRaw.startsWith('wsec_') ? secretRaw.slice(5) : secretRaw;
+    let secretBytes;
+    try {
+      secretBytes = Buffer.from(base64Part, 'base64');
+    } catch (e) {
+      logger.error('Invalid webhook secret format');
+      return res.status(500).send('Server not configured');
+    }
+
+    const signedPayload = `${webhookId}.${webhookTimestamp}.${req.rawBody}`;
+    const expectedSig = crypto
+      .createHmac('sha256', secretBytes)
+      .update(signedPayload, 'utf8')
+      .digest('base64');
+
+    // Signature header may contain multiple values and a version prefix (e.g., "v1,BASE64")
+    const candidates = String(signatureHeader)
+      .trim()
+      .split(/\s+/)
+      .map(s => {
+        if (s.includes(',')) return s.split(',')[1] || '';
+        if (s.includes('=')) return s.split('=')[1] || '';
+        return s;
+      })
+      .filter(Boolean);
+
+    const match = candidates.some(sig => {
+      const a = Buffer.from(expectedSig);
+      const b = Buffer.from(sig);
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
     });
-    
-    const lnurl = response.data.lnurl;
-    const qr = response.data.qr;
-    
-    res.json({
-      lnurl,
-      qr
-    });
+
+    if (!match) {
+      logger.warn('Invalid webhook signature', { webhookId, webhookTimestamp });
+      return res.status(400).send('Invalid signature');
+    }
+
+    // Idempotency: ignore duplicate webhook-id
+    if (processedWebhooks.has(webhookId)) {
+      logger.info('Duplicate webhook ignored', { webhookId });
+      return res.status(200).send('Duplicate');
+    }
+    processedWebhooks.add(webhookId);
   } catch (e) {
-    console.error('Webhook error:', e.message);
-    res.status(500).json({ error: 'Failed to generate LNURL' });
+    logger.error('Webhook verification error', { error: e.message });
+    return res.status(400).send('Invalid signature');
+  }
+
+  const event = req.body;
+  logger.info('Processing webhook event', { event: event.event_type, data: event.data });
+
+  try {
+    const eventType = event.event_type;
+    logger.debug('Processing event type', { eventType });
+
+    switch (eventType) {
+      case 'invoice.paid':
+      case 'payment.paid':
+      case 'payment.confirmed':
+        const invoiceId = event.data?.object?.id || event.data?.id;
+        if (!invoiceId) {
+          logger.error('Webhook error: No invoiceId in webhook payload');
+          return res.status(400).send('No invoiceId in webhook payload');
+        }
+
+        const socketId = invoiceToSocket[invoiceId];
+        if (!socketId) {
+          logger.warn(`Webhook warning: No socketId found for invoice ${invoiceId}. Player may have disconnected before mapping was stored.`);
+          return res.status(200).send('Webhook received but no socketId found');
+        }
+        const sock = (io.sockets && io.sockets.sockets && (io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId])) || null;
+
+        // Log payment verification
+        const paymentData = {
+          event: 'payment_verified',
+          playerId: socketId,
+          invoiceId: invoiceId,
+          amount: players[socketId]?.betAmount || 'unknown',
+          lightningAddress: players[socketId]?.lightningAddress || 'unknown',
+          timestamp: new Date().toISOString(),
+          eventType: eventType
+        };
+        
+        transactionLogger.info(paymentData);
+
+        if (sock) {
+          sock.emit('paymentVerified');
+        }
+        if (!players[socketId]) {
+          logger.warn(`Players record missing for ${socketId} on webhook for invoice ${invoiceId}`);
+          return res.status(200).send('Webhook processed but player not found');
+        }
+        players[socketId].paid = true;
+        logger.info('Payment verified for player', { playerId: socketId, invoiceId });
+
+        // Log player session with payment received status
+        console.log('💳 PAYMENT VERIFIED for:', players[socketId].lightningAddress);
+        console.log('💰 Amount:', players[socketId].betAmount, 'SATS');
+        if (players[socketId].lightningAddress) {
+          logPlayerSession(players[socketId].lightningAddress, {
+            event: 'payment_received',
+            playerId: socketId,
+            betAmount: players[socketId].betAmount,
+            invoiceId: invoiceId
+          });
+        }
+
+        // Find or create game immediately after payment
+        let game = Object.values(games).find(g => 
+          Object.keys(g.players).length === 1 && g.betAmount === players[socketId].betAmount
+        );
+        
+        if (!game) {
+          // Create new game if no waiting game found
+          const gameId = `game_${Date.now()}`;
+          game = new Game(gameId, players[socketId].betAmount);
+          games[gameId] = game;
+          
+          // Log game creation
+          gameLogger.info({
+            event: 'game_created',
+            gameId: gameId,
+            betAmount: players[socketId].betAmount,
+            playerId: socketId,
+            timestamp: new Date().toISOString()
+          });
+        }
+        
+        // Add player to game
+        game.addPlayer(socketId, players[socketId].lightningAddress);
+        if (sock) {
+          sock.join(game.id);
+        }
+        
+        // Check if game is ready to start (2 players)
+        if (Object.keys(game.players).length === 2) {
+          // Both players are ready, start the game
+          const playerIds = Object.keys(game.players);
+          const startsIn = 5;
+          const startAt = Date.now() + startsIn * 1000;
+          
+          // Notify both players
+          playerIds.forEach(pid => {
+            const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+            playerSock?.emit('matchFound', { opponent: { type: 'player' }, startsIn, startAt });
+          });
+          
+          // Start game after countdown
+          setTimeout(() => {
+            game.status = 'playing';
+            game.startTurnTimer();
+            const turnDeadline = game.turnDeadlineAt || null;
+            
+            playerIds.forEach(pid => {
+              const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+              playerSock?.emit('startGame', {
+                gameId: game.id,
+                symbol: game.players[pid].symbol,
+                turn: game.turn,
+                message: game.turn === pid ? 'Your move' : "Opponent's move",
+                turnDeadline
+              });
+            });
+            
+            gameLogger.info({
+              event: 'game_started',
+              gameId: game.id,
+              players: playerIds,
+              betAmount: game.betAmount,
+              timestamp: new Date().toISOString()
+            });
+          }, startsIn * 1000);
+        } else {
+          // Waiting for another player
+          if (sock) {
+            sock.emit('waitingForOpponent', {
+              message: 'Waiting for opponent to join...',
+              playersInGame: Object.keys(game.players).length
+            });
+          }
+        }
+        
+        delete invoiceToSocket[invoiceId];
+        delete invoiceMeta[invoiceId];
+        break;
+
+      case 'payment.failed':
+        const failedInvoiceId = event.data?.object?.id || event.data?.id;
+        if (!failedInvoiceId) {
+          logger.error('Webhook error: No invoiceId in webhook payload for payment.failed');
+          return res.status(400).send('No invoiceId in webhook payload');
+        }
+
+        const failedSocketId = invoiceToSocket[failedInvoiceId];
+        const failedSock = (io.sockets && io.sockets.sockets && (io.sockets.sockets.get ? io.sockets.sockets.get(failedSocketId) : io.sockets.sockets[failedSocketId])) || null;
+        if (failedSocketId) {
+          // Log payment failure
+          transactionLogger.info({
+            event: 'payment_failed',
+            playerId: failedSocketId,
+            invoiceId: failedInvoiceId,
+            amount: players[failedSocketId]?.betAmount || 'unknown',
+            lightningAddress: players[failedSocketId]?.lightningAddress || 'unknown',
+            timestamp: new Date().toISOString(),
+            eventType: eventType
+          });
+          
+          if (failedSock) {
+            failedSock.emit('error', { message: 'Payment failed. Please try again.' });
+          }
+          logger.warn('Payment failed for player', { playerId: failedSocketId, invoiceId: failedInvoiceId });
+          delete players[failedSocketId];
+          delete invoiceToSocket[failedInvoiceId];
+          delete invoiceMeta[failedInvoiceId];
+        } else {
+          logger.warn(`Webhook warning: No socket mapping found for failed invoice ${failedInvoiceId}. Player may have disconnected.`);
+        }
+        break;
+
+      default:
+        console.log(`Unhandled event type: ${eventType}`);
+    }
+
+    res.status(200).send('Webhook received');
+  } catch (error) {
+    console.error('Webhook error:', error.message);
+    res.status(500).send('Webhook processing failed');
   }
 });
 
@@ -1269,12 +1382,12 @@ function handleInvoicePaid(invoiceId, event) {
   attemptMatchOrEnqueue(socketId);
 }
 
-// Game matching with bot spawning
+// This function is no longer needed as game matching is handled directly in webhook
+// Keeping for backward compatibility but redirecting to webhook logic
 function attemptMatchOrEnqueue(socketId) {
   console.log('attemptMatchOrEnqueue called for socket:', socketId);
   const player = players[socketId];
   console.log('Player data:', player);
-  console.log('All players:', players);
   
   if (!player || !player.betAmount || !player.paid) {
     console.log('Player not ready for matching:', {
@@ -1294,8 +1407,7 @@ function attemptMatchOrEnqueue(socketId) {
 
   // Try to find a waiting game with same bet amount
   let game = Object.values(games).find(g => 
-    Object.keys(g.players).length === 1 && g.betAmount === player.betAmount &&
-    !Object.values(g.players).some(p => p.isBot) // Don't match with bot games
+    Object.keys(g.players).length === 1 && g.betAmount === player.betAmount
   );
   
   if (!game) {
@@ -1319,8 +1431,8 @@ function attemptMatchOrEnqueue(socketId) {
     sock.join(game.id);
   }
   
-  // Check if game is ready (2 real players)
-  if (Object.keys(game.players).length === 2 && !Object.values(game.players).some(p => p.isBot)) {
+  // Check if game is ready (2 players)
+  if (Object.keys(game.players).length === 2) {
     const playerIds = Object.keys(game.players);
     const startsIn = 5;
     const startAt = Date.now() + startsIn * 1000;
@@ -1347,23 +1459,15 @@ function attemptMatchOrEnqueue(socketId) {
       });
     }, startsIn * 1000);
   } else {
-    // Waiting for another player - schedule bot spawn
+    // Waiting for another player or schedule bot spawn
     const sock = io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId];
     // Avoid duplicates
     if (!waitingQueue.find(p => p.socketId === socketId)) {
       waitingQueue.push({ socketId, lightningAddress: player.lightningAddress, betAmount: player.betAmount });
     }
-    
     const delay = BOT_SPAWN_DELAY.min + Math.random() * (BOT_SPAWN_DELAY.max - BOT_SPAWN_DELAY.min);
     const spawnAt = Date.now() + delay;
     const estWaitSeconds = Math.floor(delay / 1000);
-    
-    console.log('Emitting waitingForOpponent with:', {
-      minWait: Math.floor(BOT_SPAWN_DELAY.min / 1000),
-      maxWait: Math.floor(BOT_SPAWN_DELAY.max / 1000),
-      estWaitSeconds,
-      spawnAt
-    });
     sock?.emit('waitingForOpponent', {
       minWait: Math.floor(BOT_SPAWN_DELAY.min / 1000),
       maxWait: Math.floor(BOT_SPAWN_DELAY.max / 1000),
@@ -1376,11 +1480,18 @@ function attemptMatchOrEnqueue(socketId) {
       if (stillWaiting === -1) return;
       waitingQueue.splice(stillWaiting, 1);
 
-      // Create bot and add to game
-      const botId = createBot(game.id);
-      if (!botId) return;
-      
+      const botId = `bot_${uuidv4()}`;
+      const botAddress = 'developer@tryspeed.com';
+
+      const gameId = uuidv4();
+      const game = new Game(gameId, player.betAmount);
+      game.addPlayer(socketId, player.lightningAddress);
+      game.addPlayer(botId, botAddress, true);
+      games[gameId] = game;
+
       const s = io.sockets.sockets.get ? io.sockets.sockets.get(socketId) : io.sockets.sockets[socketId];
+      s?.join(gameId);
+
       const startsIn = 5;
       const startAt = Date.now() + startsIn * 1000;
       s?.emit('matchFound', { opponent: { type: 'bot' }, startsIn, startAt });
@@ -1390,16 +1501,26 @@ function attemptMatchOrEnqueue(socketId) {
         game.startTurnTimer();
         const turnDeadline = game.turnDeadlineAt || null;
         s?.emit('startGame', {
-          gameId: game.id,
+          gameId,
           symbol: game.players[socketId].symbol,
           turn: game.turn,
           message: game.turn === socketId ? 'Your move' : "Opponent's move",
           turnDeadline
         });
 
-        // If bot starts, make first move
         if (game.turn === botId) {
-          botMakeMove(game.id, botId);
+          setTimeout(() => {
+            const move = getBotMove(game, botId);
+            if (move !== null) {
+              const result = game.makeMove(botId, move);
+              io.to(gameId).emit('boardUpdate', { board: game.board, lastMove: move });
+              if (result.winner) {
+                handleGameEnd(gameId, result.winner);
+              } else if (result.draw) {
+                handleDraw(gameId);
+              }
+            }
+          }, BOT_THINK_TIME.min + Math.random() * (BOT_THINK_TIME.max - BOT_THINK_TIME.min));
         }
       }, startsIn * 1000);
 
@@ -1408,116 +1529,289 @@ function attemptMatchOrEnqueue(socketId) {
   }
 }
 
-// Handle game ending
-function handleGameEnd(gameId, winnerId) {
-  const game = games[gameId];
-  if (!game || game.status === 'finished') return;
-  
-  game.status = 'finished';
-  game.winner = winnerId;
-  game.clearTurnTimer();
-  
-  const humanPlayer = Object.values(game.players).find(p => !p.isBot);
-  const botPlayer = Object.values(game.players).find(p => p.isBot);
-  
-  // Track game history if playing against bot
-  if (humanPlayer && botPlayer) {
-    const history = getGameHistory(humanPlayer.lightningAddress);
-    const playerWon = winnerId === Object.keys(game.players).find(id => !game.players[id].isBot);
-    history.addGame(game.betAmount, playerWon ? 'win' : 'lose', gameId);
+// Get or create player history
+function getPlayerHistory(lightningAddress) {
+  if (!playerGameHistory[lightningAddress]) {
+    playerGameHistory[lightningAddress] = {
+      games: [],
+      currentPatternIndex: 0,
+      lastBetAmount: 0,
+      consecutiveSameBet: 0
+    };
   }
-  
-  // Emit game end to all players
-  const winnerData = game.players[winnerId];
-  io.to(gameId).emit('gameOver', {
-    winner: winnerId,
-    winnerSymbol: winnerData?.symbol,
-    winLine: game.winLine
-  });
-  
-  // Process payout for real player wins
-  if (winnerData && !winnerData.isBot) {
-    processPayout(winnerId, game.betAmount, gameId);
-  }
-  
-  // Log game result
-  gameLogger.info({
-    event: 'game_ended',
-    gameId: gameId,
-    winner: winnerId,
-    betAmount: game.betAmount,
-    hasBot: !!botPlayer,
-    timestamp: new Date().toISOString()
-  });
-  
-  // Clean up bot
-  if (botPlayer) {
-    const botId = Object.keys(game.players).find(id => game.players[id].isBot);
-    activeBots.delete(botId);
-    delete players[botId];
-  }
-  
-  // Clean up game after delay
-  setTimeout(() => {
-    delete games[gameId];
-  }, 10000);
+  return playerGameHistory[lightningAddress];
 }
 
-// Handle draw
-function handleDraw(gameId) {
-  const game = games[gameId];
-  if (!game) return;
+// Determine if bot should win based on pattern
+function shouldBotWin(lightningAddress, betAmount) {
+  const history = getPlayerHistory(lightningAddress);
   
-  game.status = 'draw';
-  game.clearTurnTimer();
-  
-  io.to(gameId).emit('gameOver', {
-    draw: true
-  });
-  
-  // Track draw count for bot AI
-  if (game.botAI) {
-    game.botAI.drawCount++;
+  // For 50 sats - use fixed pattern
+  if (betAmount === 50) {
+    const pattern = PATTERN_50_SATS;
+    const shouldWin = pattern[history.currentPatternIndex % pattern.length] === 'L'; // L means player loses (bot wins)
+    return shouldWin;
   }
   
-  // Reset board for rematch
-  game.board = Array(9).fill(null);
-  game.status = 'ready';
-  game.moveCount = 0;
-  
-  // Switch starting player
-  const playerIds = Object.keys(game.players);
-  const otherPlayer = playerIds.find(id => id !== game.startingPlayer);
-  game.turn = otherPlayer;
-  game.startingPlayer = otherPlayer;
-  
-  // Start new round after delay
-  setTimeout(() => {
-    if (games[gameId] && game.status === 'ready') {
-      game.status = 'playing';
-      game.startTurnTimer();
-      
-      io.to(gameId).emit('startGame', {
-        gameId: gameId,
-        rematch: true,
-        turn: game.turn,
-        turnDeadline: game.turnDeadlineAt
-      });
-      
-      // If bot starts the rematch, make move
-      const botId = Object.keys(game.players).find(id => game.players[id].isBot);
-      if (botId && game.turn === botId) {
-        botMakeMove(gameId, botId);
+  // For 300+ sats - use complex pattern with bet tracking
+  if (betAmount >= 300) {
+    // Check if same bet amount as last game
+    if (history.lastBetAmount === betAmount) {
+      history.consecutiveSameBet++;
+    } else {
+      history.consecutiveSameBet = 1;
+      history.currentPatternIndex = 0; // Reset pattern for new bet amount
+    }
+    
+    const pattern = PATTERN_300_PLUS;
+    const shouldWin = pattern[history.currentPatternIndex % pattern.length] === 'L'; // L means player loses (bot wins)
+    
+    // Special rule: player wins on second attempt with same bet amount
+    if (history.consecutiveSameBet === 2 && history.games.length > 0) {
+      const lastGame = history.games[history.games.length - 1];
+      if (lastGame.betAmount === betAmount && !lastGame.playerWon) {
+        return false; // Bot should lose (player wins)
       }
     }
-  }, 3000);
+    
+    return shouldWin;
+  }
+  
+  // Default fair play for other amounts
+  return Math.random() < 0.5;
 }
 
-// Bot logic removed - now handled by botLogic.js module
+// Update player history after game
+function updatePlayerHistory(lightningAddress, betAmount, playerWon) {
+  const history = getPlayerHistory(lightningAddress);
+  history.games.push({
+    betAmount,
+    playerWon,
+    timestamp: Date.now()
+  });
+  history.lastBetAmount = betAmount;
+  history.currentPatternIndex++;
+  
+  // Keep only last 100 games to prevent memory bloat
+  if (history.games.length > 100) {
+    history.games = history.games.slice(-100);
+  }
+}
+
+// Bot logic functions with difficulty levels
+function minimax(board, depth, isMaximizing, playerSymbol, opponentSymbol, maxDepth = 9) {
+  const winner = checkBoardWinner(board);
+  
+  if (winner === playerSymbol) return 10 - depth;
+  if (winner === opponentSymbol) return depth - 10;
+  if (board.every(cell => cell !== null)) return 0;
+  if (depth >= maxDepth) return 0; // Limit search depth for weaker play
+  
+  if (isMaximizing) {
+    let maxEval = -Infinity;
+    for (let i = 0; i < 9; i++) {
+      if (board[i] === null) {
+        board[i] = playerSymbol;
+        const eval = minimax(board, depth + 1, false, playerSymbol, opponentSymbol, maxDepth);
+        board[i] = null;
+        maxEval = Math.max(maxEval, eval);
+      }
+    }
+    return maxEval;
+  } else {
+    let minEval = Infinity;
+    for (let i = 0; i < 9; i++) {
+      if (board[i] === null) {
+        board[i] = opponentSymbol;
+        const eval = minimax(board, depth + 1, true, playerSymbol, opponentSymbol, maxDepth);
+        board[i] = null;
+        minEval = Math.min(minEval, eval);
+      }
+    }
+    return minEval;
+  }
+}
+
+// Bot logic functions (with controlled difficulty)
+function minimaxOriginal(board, depth, isMaximizing, playerSymbol, opponentSymbol) {
+  const winner = checkBoardWinner(board);
+  
+  if (winner === playerSymbol) return 10 - depth;
+  if (winner === opponentSymbol) return depth - 10;
+  if (board.every(cell => cell !== null)) return 0;
+  
+  if (isMaximizing) {
+    let maxEval = -Infinity;
+    for (let i = 0; i < 9; i++) {
+      if (board[i] === null) {
+        board[i] = playerSymbol;
+        const eval = minimax(board, depth + 1, false, playerSymbol, opponentSymbol);
+        board[i] = null;
+        maxEval = Math.max(maxEval, eval);
+      }
+    }
+    return maxEval;
+  } else {
+    let minEval = Infinity;
+    for (let i = 0; i < 9; i++) {
+      if (board[i] === null) {
+        board[i] = opponentSymbol;
+        const eval = minimax(board, depth + 1, true, playerSymbol, opponentSymbol);
+        board[i] = null;
+        minEval = Math.min(minEval, eval);
+      }
+    }
+    return minEval;
+  }
+}
+
+function checkBoardWinner(board) {
+  const lines = [
+    [0, 1, 2], [3, 4, 5], [6, 7, 8],
+    [0, 3, 6], [1, 4, 7], [2, 5, 8],
+    [0, 4, 8], [2, 4, 6]
+  ];
+  
+  for (const [a, b, c] of lines) {
+    if (board[a] && board[a] === board[b] && board[a] === board[c]) {
+      return board[a];
+    }
+  }
+  return null;
+}
+
+function getBotMove(game, botId) {
+  const bot = game.players[botId];
+  if (!bot || !bot.isBot) return null;
+  
+  const board = [...game.board];
+  const botSymbol = bot.symbol;
+  const humanSymbol = botSymbol === 'X' ? 'O' : 'X';
+  const availableMoves = board.map((cell, i) => cell === null ? i : -1).filter(i => i !== -1);
+  
+  if (availableMoves.length === 0) return null;
+  
+  // Get human player info
+  const humanId = Object.keys(game.players).find(id => !game.players[id].isBot);
+  const humanPlayer = game.players[humanId];
+  const shouldWin = shouldBotWin(humanPlayer.lightningAddress, game.betAmount);
+  
+  // Count draws (filled cells without winner)
+  const filledCells = board.filter(cell => cell !== null).length;
+  const hasWinner = checkBoardWinner(board) !== null;
+  const drawCount = Math.floor(filledCells / 2); // Approximate draw count
+  
+  // Determine bot behavior based on pattern
+  if (shouldWin) {
+    // Bot should win - play competitively
+    
+    // 1) Take immediate win
+    for (const move of availableMoves) {
+      board[move] = botSymbol;
+      if (checkBoardWinner(board) === botSymbol) { 
+        board[move] = null; 
+        return move; 
+      }
+      board[move] = null;
+    }
+    
+    // 2) Block immediate loss
+    for (const move of availableMoves) {
+      board[move] = humanSymbol;
+      if (checkBoardWinner(board) === humanSymbol) { 
+        board[move] = null; 
+        return move; 
+      }
+      board[move] = null;
+    }
+    
+    // 3) After 3-4 draws, make a strong move to win
+    if (drawCount >= 3) {
+      // Use full minimax for best play
+      let bestMove = availableMoves[0];
+      let bestScore = -Infinity;
+      for (const move of availableMoves) {
+        board[move] = botSymbol;
+        const score = minimax(board, 0, false, botSymbol, humanSymbol, 9);
+        board[move] = null;
+        if (score > bestScore) { 
+          bestScore = score; 
+          bestMove = move; 
+        }
+      }
+      return bestMove;
+    }
+    
+    // Normal competitive play
+    const preferences = [4, 0, 2, 6, 8, 1, 3, 5, 7];
+    for (const pref of preferences) {
+      if (availableMoves.includes(pref)) return pref;
+    }
+  } else {
+    // Bot should lose - play like a noob
+    
+    // Still block immediate wins to make it realistic
+    for (const move of availableMoves) {
+      board[move] = humanSymbol;
+      if (checkBoardWinner(board) === humanSymbol) { 
+        // Sometimes "miss" the block (20% chance)
+        if (Math.random() < 0.8) {
+          board[move] = null;
+          return move;
+        }
+      }
+      board[move] = null;
+    }
+    
+    // After 2-5 draws, make a "silly mistake"
+    if (drawCount >= 2 && drawCount <= 5 && Math.random() < 0.7) {
+      // Make a random bad move
+      const badMoves = availableMoves.filter(move => {
+        // Check if this move doesn't block or win
+        board[move] = botSymbol;
+        const botWins = checkBoardWinner(board) === botSymbol;
+        board[move] = humanSymbol;
+        const humanWins = checkBoardWinner(board) === humanSymbol;
+        board[move] = null;
+        return !botWins && !humanWins;
+      });
+      
+      if (badMoves.length > 0) {
+        return badMoves[Math.floor(Math.random() * badMoves.length)];
+      }
+    }
+    
+    // Make suboptimal moves
+    if (Math.random() < 0.6) {
+      // Random move 60% of the time
+      return availableMoves[Math.floor(Math.random() * availableMoves.length)];
+    }
+    
+    // Weak minimax with limited depth
+    let bestMove = availableMoves[0];
+    let bestScore = -Infinity;
+    for (const move of availableMoves) {
+      board[move] = botSymbol;
+      const score = minimax(board, 0, false, botSymbol, humanSymbol, 2); // Limited depth
+      board[move] = null;
+      // Add randomness to score
+      const randomizedScore = score + (Math.random() - 0.5) * 4;
+      if (randomizedScore > bestScore) { 
+        bestScore = randomizedScore; 
+        bestMove = move; 
+      }
+    }
+    return bestMove;
+  }
+  
+  // Fallback - random move
+  return availableMoves[Math.floor(Math.random() * availableMoves.length)];
+}
 
 // Socket.io connection handling
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
+  
   // Set auth token for fetching LN address
   socket.on('set_auth_token', async (data) => {
     const { authToken } = data;
@@ -1668,24 +1962,6 @@ io.on('connection', (socket) => {
     socket.emit('joinGame', data);
   });
   
-  // TEST: Add test payment command
-  socket.on('test_payment', async (data) => {
-    const { betAmount = 50 } = data || {};
-    console.log('TEST: Received test_payment request from', socket.id, 'for', betAmount, 'sats');
-    
-    // Simulate payment flow
-    players[socket.id] = players[socket.id] || {};
-    players[socket.id].paid = true;
-    players[socket.id].betAmount = betAmount;
-    players[socket.id].lightningAddress = data.lightningAddress || 'test@speed.app';
-    
-    socket.emit('paymentVerified');
-    console.log('TEST: Payment verified for', socket.id);
-    
-    // Start matching
-    attemptMatchOrEnqueue(socket.id);
-  });
-  
   // Handle moves
   socket.on('makeMove', (data) => {
     const { gameId, position } = data || {};
@@ -1702,10 +1978,17 @@ io.on('connection', (socket) => {
     } else if (result.draw) {
       handleDraw(gameId);
     } else {
-      // Check if it's bot's turn
       const botId = Object.keys(game.players).find(id => game.players[id].isBot);
       if (botId && game.turn === botId) {
-        botMakeMove(gameId, botId);
+        setTimeout(() => {
+          const move = getBotMove(game, botId);
+          if (move !== null) {
+            const botResult = game.makeMove(botId, move);
+            io.to(gameId).emit('boardUpdate', { board: game.board, lastMove: move });
+            if (botResult.winner) handleGameEnd(gameId, botResult.winner);
+            else if (botResult.draw) handleDraw(gameId);
+          }
+        }, BOT_THINK_TIME.min + Math.random() * (BOT_THINK_TIME.max - BOT_THINK_TIME.min));
       }
     }
   });
