@@ -1240,19 +1240,30 @@ app.post('/webhook', (req, res) => {
           
           // Start game after countdown
           setTimeout(() => {
+            // Double-check game still exists
+            if (!games[game.id]) {
+              console.log(`Game ${game.id} no longer exists, skipping start`);
+              return;
+            }
+            
             game.status = 'playing';
             game.startTurnTimer();
             const turnDeadline = game.turnDeadlineAt || null;
             
             playerIds.forEach(pid => {
               const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
-              playerSock?.emit('startGame', {
-                gameId: game.id,
-                symbol: game.players[pid].symbol,
-                turn: game.turn,
-                message: game.turn === pid ? 'Your move' : "Opponent's move",
-                turnDeadline
-              });
+              if (playerSock && playerSock.connected) {
+                playerSock.emit('startGame', {
+                  gameId: game.id,
+                  symbol: game.players[pid].symbol,
+                  turn: game.turn,
+                  message: game.turn === pid ? 'Your move' : "Opponent's move",
+                  turnDeadline
+                });
+                console.log(`Sent startGame to player ${pid}`);
+              } else {
+                console.log(`Player ${pid} socket not connected for game start`);
+              }
             });
             
             gameLogger.info({
@@ -1316,6 +1327,12 @@ app.post('/webhook', (req, res) => {
                 
                 // Start game after countdown
                 setTimeout(() => {
+                  // Double-check game still exists
+                  if (!games[currentGame.id]) {
+                    console.log(`Game ${currentGame.id} no longer exists, skipping bot game start`);
+                    return;
+                  }
+                  
                   currentGame.status = 'playing';
                   currentGame.startTurnTimer();
                   const turnDeadline = currentGame.turnDeadlineAt || null;
@@ -1323,13 +1340,18 @@ app.post('/webhook', (req, res) => {
                   playerIds.forEach(pid => {
                     if (!currentGame.players[pid].isBot) {
                       const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
-                      playerSock?.emit('startGame', {
-                        gameId: currentGame.id,
-                        symbol: currentGame.players[pid].symbol,
-                        turn: currentGame.turn,
-                        message: currentGame.turn === pid ? 'Your move' : "Opponent's move",
-                        turnDeadline
-                      });
+                      if (playerSock && playerSock.connected) {
+                        playerSock.emit('startGame', {
+                          gameId: currentGame.id,
+                          symbol: currentGame.players[pid].symbol,
+                          turn: currentGame.turn,
+                          message: currentGame.turn === pid ? 'Your move' : "Opponent's move",
+                          turnDeadline
+                        });
+                        console.log(`Sent startGame to human player ${pid} in bot game`);
+                      } else {
+                        console.log(`Human player ${pid} disconnected before bot game start`);
+                      }
                     }
                   });
                   
@@ -2040,10 +2062,39 @@ function handleDraw(gameId) {
   delete games[gameId];
 }
 
+// Keep-alive mechanism to prevent server shutdown
+setInterval(() => {
+  const memUsage = process.memoryUsage();
+  console.log(`[Keep-Alive] Server healthy - Memory: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB, Active games: ${Object.keys(games).length}, Uptime: ${Math.round(process.uptime())}s`);
+  
+  // Clean up any orphaned games older than 1 hour
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  Object.entries(games).forEach(([gameId, game]) => {
+    if (game.createdAt && game.createdAt < oneHourAgo && game.status === 'finished') {
+      delete games[gameId];
+      console.log(`[Cleanup] Removed old game: ${gameId}`);
+    }
+  });
+}, 30000); // Every 30 seconds
+
+// Prevent process from exiting on uncaught errors
+process.on('uncaughtException', (err) => {
+  errorLogger.error('Uncaught Exception:', err);
+  console.error('Uncaught Exception:', err);
+  // Don't exit, keep server running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  errorLogger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit, keep server running
+});
+
 // Start server (Render/Railway will set PORT)
 const PORT = process.env.PORT || process.env.BACKEND_PORT || 4000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Speed Wallet API: ${SPEED_API_BASE}`);
   console.log(`Allowed origin: ${process.env.ALLOWED_ORIGIN}`);
+  console.log(`[Keep-Alive] Server will stay up for 10,000 years!`);
 });
