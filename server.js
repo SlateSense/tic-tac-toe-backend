@@ -1250,19 +1250,26 @@ app.post('/webhook', (req, res) => {
             game.startTurnTimer();
             const turnDeadline = game.turnDeadlineAt || null;
             
+            // Store game-player mapping for reconnection
             playerIds.forEach(pid => {
-              const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
-              if (playerSock && playerSock.connected) {
-                playerSock.emit('startGame', {
-                  gameId: game.id,
-                  symbol: game.players[pid].symbol,
-                  turn: game.turn,
-                  message: game.turn === pid ? 'Your move' : "Opponent's move",
-                  turnDeadline
-                });
-                console.log(`Sent startGame to player ${pid}`);
-              } else {
-                console.log(`Player ${pid} socket not connected for game start`);
+              const player = game.players[pid];
+              if (player && player.lightningAddress) {
+                // Store mapping of Lightning address to game for reconnection
+                const playerSock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+                if (playerSock && playerSock.connected) {
+                  playerSock.gameId = game.id;
+                  playerSock.playerIdInGame = pid;
+                  playerSock.emit('startGame', {
+                    gameId: game.id,
+                    symbol: game.players[pid].symbol,
+                    turn: game.turn,
+                    message: game.turn === pid ? 'Your move' : "Opponent's move",
+                    turnDeadline
+                  });
+                  console.log(`Sent startGame to player ${pid}`);
+                } else {
+                  console.log(`Player ${pid} socket not connected for game start`);
+                }
               }
             });
             
@@ -1876,9 +1883,25 @@ io.on('connection', (socket) => {
   socket.on('makeMove', (data) => {
     const { gameId, position } = data || {};
     const game = games[gameId];
-    if (!game || game.turn !== socket.id) return socket.emit('error', { message: 'Invalid move' });
+    if (!game) return socket.emit('error', { message: 'Game not found' });
+    
+    // Find the player ID in the game that matches this socket
+    let playerIdInGame = null;
+    for (const [pid, player] of Object.entries(game.players)) {
+      // Check if this is the current socket or if it matches by Lightning address
+      if (pid === socket.id || 
+          (players[socket.id] && player.lightningAddress === players[socket.id].lightningAddress)) {
+        playerIdInGame = pid;
+        break;
+      }
+    }
+    
+    if (!playerIdInGame || game.turn !== playerIdInGame) {
+      console.log(`Invalid move attempt: socket=${socket.id}, playerInGame=${playerIdInGame}, turn=${game.turn}`);
+      return socket.emit('error', { message: 'Not your turn' });
+    }
 
-    const result = game.makeMove(position, socket.id);
+    const result = game.makeMove(position, playerIdInGame);
     if (!result.success) return socket.emit('error', { message: result.message || 'Invalid move' });
 
     // Emit move to all players
@@ -1887,7 +1910,7 @@ io.on('connection', (socket) => {
         const sock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
         sock?.emit('moveMade', {
           position: position,
-          symbol: game.players[socket.id].symbol,
+          symbol: game.players[playerIdInGame].symbol,
           nextTurn: result.nextTurn,
           board: game.board,
           turnDeadline: game.turnDeadlineAt
