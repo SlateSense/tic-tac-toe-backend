@@ -1901,8 +1901,14 @@ io.on('connection', (socket) => {
       return socket.emit('error', { message: 'Not your turn' });
     }
 
-    const result = game.makeMove(position, playerIdInGame);
-    if (!result.success) return socket.emit('error', { message: result.message || 'Invalid move' });
+    const result = game.makeMove(playerIdInGame, position);
+    if (!result.ok) {
+      const errorMsg = result.reason === 'not_playing' ? 'Game not started' :
+                       result.reason === 'not_your_turn' ? 'Not your turn' :
+                       result.reason === 'bad_pos' ? 'Invalid position' :
+                       result.reason === 'occupied' ? 'Position already taken' : 'Invalid move';
+      return socket.emit('error', { message: errorMsg });
+    }
 
     // Emit move to all players
     Object.keys(game.players).forEach(pid => {
@@ -1911,7 +1917,7 @@ io.on('connection', (socket) => {
         sock?.emit('moveMade', {
           position: position,
           symbol: game.players[playerIdInGame].symbol,
-          nextTurn: result.nextTurn,
+          nextTurn: game.turn,
           board: game.board,
           turnDeadline: game.turnDeadlineAt
         });
@@ -1919,7 +1925,7 @@ io.on('connection', (socket) => {
     });
 
     if (result.winner) {
-      handleGameEnd(gameId, result.winner);
+      handleGameEnd(gameId, result.winner, result.winLine);
     } else if (result.draw) {
       handleDraw(gameId);
     } else {
