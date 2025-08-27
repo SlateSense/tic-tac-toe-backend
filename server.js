@@ -794,16 +794,10 @@ class Game {
     // Expose deadline and announce next turn
     this.turnDeadlineAt = Date.now() + timeout;
     
-    // Emit to all players in the game
-    Object.keys(this.players).forEach(pid => {
-      if (!this.players[pid].isBot) {
-        const sock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
-        sock?.emit('nextTurn', {
-          turn: this.turn,
-          turnDeadline: this.turnDeadlineAt,
-          message: this.turn === pid ? 'Your move' : "Opponent's move"
-        });
-      }
+    // Emit to all players in the game room
+    io.to(this.id).emit('nextTurn', {
+      turn: this.turn,
+      turnDeadline: this.turnDeadlineAt
     });
   }
   
@@ -1621,273 +1615,21 @@ function attemptMatchOrEnqueue(socketId) {
           turnDeadline
         });
 
+        const updateTurn = ({ turn, turnDeadline }) => {
+          setTurn(turn);
+          setTurnDeadline(turnDeadline || null);
+          const ttl = turnDeadline ? Math.max(1, Math.ceil((Number(turnDeadline) - Date.now()) / 1000)) : null;
+          setTurnDuration(ttl);
+          // Determine message based on current game state
+          const isMyTurn = turn === s.id || (gameId && turn === socket.id);
+          setMessage(isMyTurn ? 'Your move' : "Opponent's move");
+        };
+
         if (game.turn === botId) {
-          setTimeout(() => {
-            const move = getBotMove(game, botId);
-            if (move !== null) {
-              const result = game.makeMove(botId, move);
-              io.to(gameId).emit('boardUpdate', { board: game.board, lastMove: move });
-              if (result.winner) {
-                handleGameEnd(gameId, result.winner);
-              } else if (result.draw) {
-                handleDraw(gameId);
-              }
-            }
-          }, BOT_THINK_TIME.min + Math.random() * (BOT_THINK_TIME.max - BOT_THINK_TIME.min));
+          makeBotMove(gameId, botId);
         }
-      }, startsIn * 1000);
-
-      delete botSpawnTimers[socketId];
-    }, delay);
-  }
-}
-
-// Make bot move with human-like delay
-function makeBotMove(gameId, botId) {
-  const game = games[gameId];
-  if (!game || game.status !== 'playing') return;
-  
-  const bot = activeBots.get(gameId);
-  if (!bot) return;
-  
-  // Get move from bot logic
-  const move = bot.getMove(game.board);
-  if (move === null || move === undefined) return;
-  
-  // Apply human-like delay
-  const delay = bot.getThinkingTime();
-  
-  setTimeout(() => {
-    // Double-check game still exists and it's bot's turn
-    if (!games[gameId] || games[gameId].status !== 'playing' || games[gameId].turn !== botId) {
-      return;
+      }, 5000);
     }
-    
-    // Make the move
-    const result = game.makeMove(botId, move);
-    
-    if (result.ok) {
-      // Emit move to all players
-      Object.keys(game.players).forEach(pid => {
-        if (!game.players[pid].isBot) {
-          const sock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
-          sock?.emit('moveMade', {
-            position: move,
-            symbol: game.players[botId].symbol,
-            nextTurn: game.turn,
-            board: game.board,
-            turnDeadline: game.turnDeadlineAt,
-            message: game.turn === pid ? 'Your move' : "Opponent's move"
-          });
-        }
-      });
-      
-      // Check for game end
-      if (result.winner) {
-        handleGameEnd(gameId, result.winner, result.winLine);
-      } else if (result.draw) {
-        handleDraw(gameId);
-      } else if (game.players[game.turn]?.isBot) {
-        // If it's still bot's turn (shouldn't happen in tic-tac-toe), make another move
-        makeBotMove(gameId, game.turn);
-      }
-    }
-  }, delay);
-}
-
-// Handle game end with bot cleanup
-function handleGameEnd(gameId, winnerId) {
-  const game = games[gameId];
-  if (!game) return;
-  
-  game.status = 'finished';
-  game.clearTurnTimer();
-  
-  // Clean up bot
-  const bot = activeBots.get(gameId);
-  if (bot) {
-    // Update player history if human player
-    const humanId = Object.keys(game.players).find(id => !game.players[id].isBot);
-    if (humanId) {
-      const humanPlayer = game.players[humanId];
-      const playerWon = winnerId === humanId;
-      bot.recordGameResult(playerWon);
-    }
-    activeBots.delete(gameId);
-  }
-  
-  // Handle payouts for real games (not bot games)
-  const botInGame = Object.values(game.players).some(p => p.isBot);
-  if (!botInGame && winnerId && game.betAmount > 0) {
-    const winner = game.players[winnerId];
-    if (winner && winner.lightningAddress) {
-      processPayout(winner.lightningAddress, game.betAmount, gameId);
-    }
-  }
-  
-  // Clean up players
-  Object.keys(game.players).forEach(pid => {
-    delete players[pid];
-  });
-  
-  // Remove game after a delay
-  setTimeout(() => {
-    delete games[gameId];
-  }, 5000);
-}
-
-// Socket.io connection handling
-io.on('connection', (socket) => {
-  console.log('New connection:', socket.id);
-  
-  // Set auth token for fetching LN address
-  socket.on('set_auth_token', async (data) => {
-    const { authToken } = data;
-    if (!authToken) return;
-    
-    try {
-      const lightningAddress = await fetchLightningAddress(authToken);
-      players[socket.id] = { 
-        ...players[socket.id], 
-        lightningAddress,
-        authToken
-      };
-      
-      socket.emit('lightning_address', { lightningAddress });
-      console.log(`Player ${socket.id} authenticated with LN address: ${lightningAddress}`);
-    } catch (error) {
-      console.error('Auth token error:', error);
-      socket.emit('auth_error', { error: error.message });
-    }
-  });
-  
-  // Sea Battle implementation - payment verified only via webhooks
-  
-  socket.on('joinGame', async (data) => {
-    try {
-      const { betAmount, lightningAddress, acctId } = data || {};
-      if (!ALLOWED_BETS.includes(betAmount)) return socket.emit('error', { message: 'Invalid bet amount' });
-
-      // Resolve and format Lightning address (allow persistence via acctId)
-      let resolvedAddress = lightningAddress && lightningAddress.trim() !== '' ? lightningAddress : null;
-      if (!resolvedAddress && acctId) {
-        const stored = getLightningAddressByAcctId(acctId);
-        if (stored) {
-          resolvedAddress = stored;
-        }
-      }
-      if (!resolvedAddress) {
-        throw new Error('Lightning address is required');
-      }
-      
-      // Only add @speed.app if not already present
-      let formattedAddress = resolvedAddress;
-      if (!formattedAddress.includes('@')) {
-        formattedAddress = `${formattedAddress}@speed.app`;
-      }
-      console.log(`Player ${socket.id} joining game: ${betAmount} SATS with Lightning address ${formattedAddress}`);
-      
-      // Map acctId to Lightning address if provided
-      if (acctId) {
-        mapUserAcctId(acctId, formattedAddress);
-        playerAcctIds[socket.id] = acctId;
-        console.log(`Mapped player ${socket.id} to acct_id: ${acctId}`);
-      }
-
-      players[socket.id] = { lightningAddress: formattedAddress, paid: false, betAmount };
-
-      // Create invoice and map to socket
-      const invoiceData = await createLightningInvoice(
-        betAmount,
-        null, // Customer ID not needed for new merchant account
-        `order_${socket.id}_${Date.now()}`
-      );
-      
-      console.log('Created invoice:', {
-        invoiceId: invoiceData.invoiceId,
-        socketId: socket.id,
-        betAmount: betAmount
-      });
-      
-      const lightningInvoice = invoiceData.lightningInvoice;
-      const hostedInvoiceUrl = invoiceData.hostedInvoiceUrl;
-
-      console.log('Payment Request created:', { 
-        invoiceId: invoiceData.invoiceId,
-        lightningInvoice: lightningInvoice?.substring(0, 50) + '...', 
-        hostedInvoiceUrl,
-        speedInterfaceUrl: invoiceData.speedInterfaceUrl 
-      });
-      
-      socket.emit('paymentRequest', {
-        lightningInvoice: lightningInvoice,
-        hostedInvoiceUrl: hostedInvoiceUrl,
-        speedInterfaceUrl: invoiceData.speedInterfaceUrl,
-        invoiceId: invoiceData.invoiceId,
-        amountSats: betAmount,
-        amountUSD: invoiceData.amountUSD
-      });
-      
-      invoiceToSocket[invoiceData.invoiceId] = socket.id;
-      invoiceMeta[invoiceData.invoiceId] = {
-        socketId: socket.id,
-        betAmount,
-        lightningAddress: formattedAddress,
-        createdAt: Date.now()
-      };
-      
-      console.log('Mapped invoice to socket:', {
-        invoiceId: invoiceData.invoiceId,
-        socketId: socket.id,
-        mappings: { invoiceToSocket, invoiceMeta }
-      });
-      
-      // Log player session start
-      logPlayerSession(formattedAddress, {
-        event: 'session_started',
-        playerId: socket.id,
-        betAmount: betAmount,
-        invoiceId: invoiceData.invoiceId
-      });
-      
-      // Set payment verification timeout (5 minutes)
-      setTimeout(() => {
-        const player = players[socket.id];
-        if (player && !player.paid) {
-          console.log(`Payment timeout for player ${socket.id}`);
-          socket.emit('paymentTimeout', {
-            message: 'Payment verification timed out. Please try again.'
-          });
-          
-          // Clean up
-          delete invoiceToSocket[invoiceData.invoiceId];
-          delete invoiceMeta[invoiceData.invoiceId];
-          delete players[socket.id];
-          
-          logPlayerSession(formattedAddress, {
-            event: 'payment_timeout',
-            playerId: socket.id,
-            betAmount: betAmount,
-            invoiceId: invoiceData.invoiceId
-          });
-        }
-      }, 5 * 60 * 1000); // 5 minutes
-      
-      console.log(`Mapped invoice ${invoiceData.invoiceId} to socket ${socket.id}`);
-    } catch (err) {
-      console.error('joinGame error:', err.message);
-      errorLogger.error({
-        event: 'join_game_failed',
-        socketId: socket.id,
-        error: err.message
-      });
-      socket.emit('error', { message: err.message || 'Could not create payment request' });
-    }
-  });
-  
-  // Also keep old event name for compatibility
-  socket.on('join_game', async (data) => {
-    socket.emit('joinGame', data);
   });
   
   // Handle moves
@@ -1921,18 +1663,13 @@ io.on('connection', (socket) => {
       return socket.emit('error', { message: errorMsg });
     }
 
-    // Emit move to all players
-    Object.keys(game.players).forEach(pid => {
-      if (!game.players[pid].isBot) {
-        const sock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
-        sock?.emit('moveMade', {
-          position: position,
-          symbol: game.players[playerIdInGame].symbol,
-          nextTurn: game.turn,
-          board: game.board,
-          turnDeadline: game.turnDeadlineAt
-        });
-      }
+    // Emit move to all players in the game room
+    io.to(game.id).emit('moveMade', {
+      position: position,
+      symbol: game.players[playerIdInGame].symbol,
+      nextTurn: game.turn,
+      board: game.board,
+      turnDeadline: game.turnDeadlineAt
     });
 
     if (result.winner) {
