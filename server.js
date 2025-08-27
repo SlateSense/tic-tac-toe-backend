@@ -1615,21 +1615,33 @@ function attemptMatchOrEnqueue(socketId) {
           turnDeadline
         });
 
-        const updateTurn = ({ turn, turnDeadline }) => {
-          setTurn(turn);
-          setTurnDeadline(turnDeadline || null);
-          const ttl = turnDeadline ? Math.max(1, Math.ceil((Number(turnDeadline) - Date.now()) / 1000)) : null;
-          setTurnDuration(ttl);
-          // Determine message based on current game state
-          const isMyTurn = turn === s.id || (gameId && turn === socket.id);
-          setMessage(isMyTurn ? 'Your move' : "Opponent's move");
-        };
-
         if (game.turn === botId) {
           makeBotMove(gameId, botId);
         }
       }, 5000);
-    }
+    }, delay);
+  }
+}
+
+// Socket.IO connection handler
+io.on('connection', (socket) => {
+  console.log('New connection:', socket.id);
+  
+  // Handle join game
+  socket.on('joinGame', (data) => {
+    const { betAmount, lightningAddress, acctId } = data;
+    
+    // Store player info
+    players[socket.id] = {
+      socketId: socket.id,
+      betAmount: betAmount,
+      lightningAddress: lightningAddress,
+      acctId: acctId,
+      paid: false
+    };
+    
+    // Create payment invoice
+    createInvoice(betAmount, socket.id, lightningAddress, acctId);
   });
   
   // Handle moves
@@ -1837,6 +1849,46 @@ function handleDraw(gameId) {
   
   io.to(gameId).emit('gameEnd', { result: 'draw' });
   delete games[gameId];
+}
+
+// Make bot move with human-like delay
+function makeBotMove(gameId, botId) {
+  const game = games[gameId];
+  if (!game || game.status !== 'playing' || game.turn !== botId) return;
+  
+  // Human-like delay (1-3 seconds)
+  const delay = 1000 + Math.random() * 2000;
+  
+  setTimeout(() => {
+    if (game.status !== 'playing' || game.turn !== botId) return;
+    
+    // Get bot move from botLogic
+    const move = getBotMove(game, botId);
+    if (move === null) return;
+    
+    // Make the move
+    const result = game.makeMove(botId, move);
+    if (result.ok) {
+      // Emit move to all players in the game room
+      io.to(game.id).emit('moveMade', {
+        position: move,
+        symbol: game.players[botId].symbol,
+        nextTurn: game.turn,
+        board: game.board,
+        turnDeadline: game.turnDeadlineAt
+      });
+      
+      // Check for game end
+      if (result.winner) {
+        handleGameEnd(gameId, result.winner, result.winLine);
+      } else if (result.draw) {
+        handleDraw(gameId);
+      } else if (game.players[game.turn]?.isBot) {
+        // If it's still bot's turn (shouldn't happen in tic-tac-toe), make another move
+        makeBotMove(gameId, game.turn);
+      }
+    }
+  }, delay);
 }
 
 // Keep-alive mechanism to prevent server shutdown
