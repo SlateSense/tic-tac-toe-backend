@@ -793,9 +793,17 @@ class Game {
 
     // Expose deadline and announce next turn
     this.turnDeadlineAt = Date.now() + timeout;
-    io.to(this.id).emit('nextTurn', {
-      turn: this.turn,
-      turnDeadline: this.turnDeadlineAt
+    
+    // Emit to all players in the game
+    Object.keys(this.players).forEach(pid => {
+      if (!this.players[pid].isBot) {
+        const sock = io.sockets.sockets.get ? io.sockets.sockets.get(pid) : io.sockets.sockets[pid];
+        sock?.emit('nextTurn', {
+          turn: this.turn,
+          turnDeadline: this.turnDeadlineAt,
+          message: this.turn === pid ? 'Your move' : "Opponent's move"
+        });
+      }
     });
   }
   
@@ -1656,9 +1664,9 @@ function makeBotMove(gameId, botId) {
     }
     
     // Make the move
-    const result = game.makeMove(move, botId);
+    const result = game.makeMove(botId, move);
     
-    if (result.success) {
+    if (result.ok) {
       // Emit move to all players
       Object.keys(game.players).forEach(pid => {
         if (!game.players[pid].isBot) {
@@ -1666,16 +1674,19 @@ function makeBotMove(gameId, botId) {
           sock?.emit('moveMade', {
             position: move,
             symbol: game.players[botId].symbol,
-            nextTurn: result.nextTurn,
+            nextTurn: game.turn,
             board: game.board,
-            turnDeadline: game.turnDeadlineAt
+            turnDeadline: game.turnDeadlineAt,
+            message: game.turn === pid ? 'Your move' : "Opponent's move"
           });
         }
       });
       
       // Check for game end
-      if (result.winner || result.draw) {
-        handleGameEnd(gameId, result.winner);
+      if (result.winner) {
+        handleGameEnd(gameId, result.winner, result.winLine);
+      } else if (result.draw) {
+        handleDraw(gameId);
       } else if (game.players[game.turn]?.isBot) {
         // If it's still bot's turn (shouldn't happen in tic-tac-toe), make another move
         makeBotMove(gameId, game.turn);
